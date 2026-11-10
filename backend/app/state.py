@@ -45,7 +45,7 @@ _ALLOWED: dict[PipelineState, frozenset[PipelineState]] = {
                                                PipelineState.CLOSE_PENDING, PipelineState.NEEDS_REVIEW,
                                                PipelineState.FAILED_PERMANENT}),
     PipelineState.CASE_CREATED: frozenset(),
-    PipelineState.SUPPRESSED: frozenset(),
+    PipelineState.SUPPRESSED: frozenset({PipelineState.NEEDS_REVIEW}),
     PipelineState.CLOSED_FP: frozenset(),
     PipelineState.FAILED_PERMANENT: frozenset({PipelineState.FAILED_RETRYABLE}),
 }

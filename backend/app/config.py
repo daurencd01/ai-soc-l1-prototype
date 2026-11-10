@@ -21,9 +21,16 @@ class Settings(BaseSettings):
     timezone: str = "Asia/Qyzylorda"
     investigation_timeout_seconds: int = 90
     max_evidence_items: int = 50
+    fingerprint_ttl_seconds: int = Field(default=86400, ge=1, le=2592000)
+    correlation_window_seconds: int = Field(default=900, ge=60, le=3600)
     splunk_base_url: str = ""
     splunk_token: str = ""
     splunk_search_template: str = "search index=main earliest={earliest} latest={latest} | head 200"
+    splunk_rule_templates_json: str = "{}"
+    splunk_search_timeout_seconds: int = Field(default=30, ge=5, le=120)
+    splunk_max_concurrent_searches: int = Field(default=2, ge=1, le=8)
+    splunk_page_size: int = Field(default=100, ge=10, le=500)
+    splunk_max_window_seconds: int = Field(default=86400, ge=3600, le=604800)
     splunk_poll_seconds: int = 60
     splunk_overlap_seconds: int = 120
     thehive_base_url: str = ""

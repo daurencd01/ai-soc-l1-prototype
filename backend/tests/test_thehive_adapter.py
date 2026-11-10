@@ -167,3 +167,96 @@ def test_thehive_response_stream_is_bounded(monkeypatch):
     monkeypatch.setattr(adapters.httpx, "Client", client_factory)
     with pytest.raises(AdapterError, match="лимит ответа"):
         real_adapter()._request("GET", "/api/v1/status")
+
+
+def test_thehive_comment_is_private_and_reconciles_by_exact_case_and_marker(monkeypatch):
+    adapter = real_adapter()
+    monkeypatch.setattr(adapters, "settings", lambda: SimpleNamespace(thehive_api_version="5.7"))
+    calls = []
+    remote = []
+
+    def request(method, path, body=None):
+        calls.append((method, path, body))
+        if path == "/api/v1/status":
+            return {"version": "5.7.8"}
+        if path == "/api/v1/query":
+            assert body["query"] == [{"_name": "getCase", "idOrName": "~case-1"},
+                                     {"_name": "comments"}]
+            return remote
+        assert path == "/api/v1/case/~case-1/comment"
+        remote.append({"_id": "~comment-1", **body})
+        return {"_id": "~comment-1"}
+
+    monkeypatch.setattr(adapter, "_request", request)
+    payload = {"message": "Analyst review requested", "external": False}
+    assert adapter.write_case_step("~case-1", "comment", payload, "comment-1") == "~comment-1"
+    assert adapter.write_case_step("~case-1", "comment", payload, "comment-1") == "~comment-1"
+    assert sum(path == "/api/v1/case/~case-1/comment" for _, path, _ in calls) == 1
+    assert remote[0]["external"] is False
+    with pytest.raises(AdapterError, match="Публичный"):
+        adapter.write_case_step("~case-1", "comment",
+                                {"message": "public", "external": True}, "comment-2")
+    with pytest.raises(AdapterError, match="отличающимися"):
+        adapter.find_case_step("~case-1", "comment",
+                               {"message": "different", "external": False}, "comment-1")
+
+
+def test_thehive_case_field_patch_is_allowlisted_and_read_back(monkeypatch):
+    adapter = real_adapter()
+    monkeypatch.setattr(adapters, "settings", lambda: SimpleNamespace(thehive_api_version="5.7"))
+    case = {"_id": "~case-1", "title": "Old", "severity": 2}
+    patches = []
+
+    def request(method, path, body=None):
+        if path == "/api/v1/status":
+            return {"version": "5.7.8"}
+        assert path == "/api/v1/case/~case-1"
+        if method == "PATCH":
+            patches.append(body)
+            case.update(body)
+            return {}
+        return dict(case)
+
+    monkeypatch.setattr(adapter, "_request", request)
+    adapter.update_case_fields("~case-1", {"title": "New", "severity": 3})
+    adapter.update_case_fields("~case-1", {"title": "New", "severity": 3})
+    assert patches == [{"title": "New", "severity": 3}]
+    with pytest.raises(AdapterError, match="Неподдерживаемые"):
+        adapter.update_case_fields("~case-1", {"tags": []})
+    with pytest.raises(AdapterError, match="Неподдерживаемые"):
+        adapter.update_case_fields("~case-1", {"status": "Resolved"})
+    with pytest.raises(AdapterError, match="критичность"):
+        adapter.update_case_fields("~case-1", {"severity": []})
+
+
+def test_thehive_case_status_rejects_wrong_case_id(monkeypatch):
+    adapter = real_adapter()
+    monkeypatch.setattr(adapter, "_request", lambda *_: {"_id": "~another", "status": "Resolved"})
+    with pytest.raises(AdapterError, match="ID кейса"):
+        adapter.case_status("~case-1")
+
+
+def test_thehive_retries_reads_but_never_mutations(monkeypatch):
+    attempts = {"GET": 0, "PATCH": 0}
+
+    def responder(request):
+        attempts[request.method] += 1
+        if request.method == "GET" and attempts["GET"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "0"})
+        if request.method == "PATCH":
+            return httpx.Response(503)
+        return httpx.Response(200, json={"version": "5.7.8"})
+
+    original_client = httpx.Client
+    transport = httpx.MockTransport(responder)
+
+    def client_factory(*args, **kwargs):
+        kwargs["transport"] = transport
+        return original_client(*args, **kwargs)
+
+    monkeypatch.setattr(adapters.httpx, "Client", client_factory)
+    monkeypatch.setattr(adapters, "sleep", lambda _: None)
+    assert real_adapter()._request("GET", "/api/v1/status") == {"version": "5.7.8"}
+    with pytest.raises(httpx.HTTPStatusError):
+        real_adapter()._request("PATCH", "/api/v1/case/~case-1", {"status": "Resolved"})
+    assert attempts == {"GET": 2, "PATCH": 1}

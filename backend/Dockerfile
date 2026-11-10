@@ -6,5 +6,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY alembic.ini .
 COPY alembic ./alembic
 COPY app ./app
+USER 10001:10001
 EXPOSE 8000
-CMD ["sh", "-c", "if [ \"$MODE\" = \"DEMO\" ]; then alembic upgrade head || exit 1; fi; exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+CMD ["sh", "-c", "if [ \"$MODE\" = \"DEMO\" ]; then alembic upgrade head || exit 1; fi; exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-access-log"]

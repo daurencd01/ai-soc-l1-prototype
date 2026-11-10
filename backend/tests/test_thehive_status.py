@@ -3,7 +3,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-from app.adapters import AdapterError, RealTheHive
+from app.adapters import AdapterError, DemoTheHive, RealTheHive
 from app.db import Base, get_db
 import app.main as main_module
 from app.models import Action, Case, Tenant, User
@@ -76,6 +76,11 @@ def test_case_status_update_is_admin_policy_gated_and_idempotent(monkeypatch):
         assert resolved_again.status_code == 200
         assert resolved_again.json()["status"] == "succeeded"
         assert resolved_again.json()["id"] != result.json()["id"]
+        DemoTheHive().update_status(case_external_id, "Open")
+        drifted = client.post(f"/api/cases/{case_id}/status", json={"status": "Open"}, headers=ah)
+        assert drifted.status_code == 422
+        assert "сверка" in drifted.text
+        DemoTheHive().update_status(case_external_id, "Resolved")
         with Session(engine) as db:
             assert db.get(Case, case_id).status == "Resolved"
             assert db.scalar(select(func.count()).select_from(Action).where(Action.kind == "update_case")) == 3

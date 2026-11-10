@@ -15,6 +15,20 @@ bearer = HTTPBearer(auto_error=False)
 ROLES = frozenset({"viewer", "analyst", "admin", "policy_approver"})
 
 
+def validate_runtime_secrets(mode: str, jwt_secret: str, webhook_secret: str) -> None:
+    """Refuse public demo and placeholder secrets before CONNECTED starts."""
+    if mode.upper() != "CONNECTED":
+        return
+    insecure = (
+        len(jwt_secret) < 32 or len(webhook_secret) < 32 or
+        jwt_secret == webhook_secret or
+        any(value.lower().startswith(("change-", "demo-", "local-demo-"))
+            for value in (jwt_secret, webhook_secret))
+    )
+    if insecure:
+        raise RuntimeError("CONNECTED требует отдельные сильные JWT_SECRET и WEBHOOK_SECRET")
+
+
 def hash_password(password: str) -> str:
     salt = os.urandom(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 310_000)

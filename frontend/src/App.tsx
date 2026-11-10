@@ -9,11 +9,13 @@ const navigation: NavItem[] = [
   { path: '/alerts', label: 'Алерты', group: 'Работа' },
   { path: '/scenarios', label: 'Сценарии DEMO', group: 'Работа' },
   { path: '/contexts', label: 'Исключения и работы', group: 'Контроль' },
+  { path: '/suppression', label: 'Подавление шума', group: 'Контроль' },
   { path: '/assets', label: 'Инвентарь активов', group: 'Контроль' },
   { path: '/metrics', label: 'Метрики', group: 'Контроль', admin: true },
   { path: '/integrations', label: 'Интеграции', group: 'Контроль' },
   { path: '/sla', label: 'Сроки обработки', group: 'Контроль' },
   { path: '/dead-letters', label: 'Ошибочные задачи', group: 'Контроль' },
+  { path: '/ingestion-quarantine', label: 'Карантин приёма', group: 'Контроль', admin: true },
   { path: '/shifts', label: 'Смены и отчёты', group: 'Учёт' },
   { path: '/audit', label: 'Аудит', group: 'Учёт' },
   { path: '/settings', label: 'Политика действий', group: 'Управление', admin: true },
@@ -51,7 +53,7 @@ function statusLabel(value: unknown): string {
     host: 'Хост', ip: 'IP-адрес', user: 'Пользователь', vpn_peer: 'VPN peer', device: 'Устройство',
     reviewed: 'Проверено', not_transferred: 'Не передано', pending_confirmation: 'Ожидает подтверждения', handoff_recorded: 'Подтверждение передачи записано',
     disabled: 'Отключено', observe: 'Наблюдение', recommend: 'Рекомендации', controlled_automation: 'Контролируемая автоматизация',
-    auto_close: 'Автозакрытие', approved_response: 'Разрешённые действия', create_case: 'Создание кейса', evidence_page: 'Страница доказательств', observable: 'Наблюдаемый объект', task: 'Задача кейса', close_alert: 'Закрытие алерта', update_case: 'Смена статуса кейса', disable_account_demo: 'DEMO: блокировка учётной записи', isolate_host_demo: 'DEMO: изолировать хост',
+    auto_close: 'Автозакрытие', approved_response: 'Разрешённые действия', create_case: 'Создание кейса', evidence_page: 'Страница доказательств', comment: 'Комментарий кейса', observable: 'Наблюдаемый объект', task: 'Задача кейса', close_alert: 'Закрытие алерта', update_case: 'Смена статуса кейса', update_case_fields: 'Обновление полей кейса', suppress_noise: 'Локальное подавление NOISE', disable_account_demo: 'DEMO: блокировка учётной записи', isolate_host_demo: 'DEMO: изолировать хост',
   }
   return labels[key] ?? valueText(value, 'Неизвестно')
 }
@@ -459,6 +461,8 @@ function Investigation({ id, user }: { id: string; user: JsonRecord }) {
         { label: 'Время события', value: dateText(alert.event_at) }, { label: 'Поступил', value: dateText(alert.received_at) },
         { label: 'Срок обработки', value: dateText(inv.due_at) }, { label: 'Правило', value: valueText(alert.rule) },
         { label: 'Конвейер', value: <Badge value={alert.pipeline_state} /> }, { label: 'Маршрут действий', value: <Badge value={inv.verdict} /> },
+         ...(alert.fingerprint ? [{ label: 'Отпечаток алерта', value: valueText(alert.fingerprint) }] : []),
+         ...(inv.correlation_key ? [{ label: 'Ключ корреляции', value: valueText(inv.correlation_key) }] : []),
       ]} /></Panel><Panel title="Текущее решение"><p className="decision-summary">{valueText(inv.summary, 'Решение ещё не сформировано.')}</p><p className="panel-intro">{valueText(inv.rationale, 'Обоснование пока не записано.')}</p><Meta entries={[
         { label: 'Приоритет', value: <Badge value={inv.priority} /> },
         { label: 'Анализатор', value: valueText(inv.analyzer) },
@@ -502,7 +506,7 @@ function filledScope(scope: Record<string, string>): Record<string, string> {
 
 function scopeText(value: unknown): string {
   const entries = Object.entries(asRecord(value))
-  return entries.length ? entries.map(([key, item]) => `${scopeFields.find(([field]) => field === key)?.[1] ?? key}: ${valueText(item)}`).join(' · ') : 'Область не задана — только контекст'
+  return entries.length ? entries.map(([key, item]) => `${key === 'failure_reason' ? 'Причина ошибки' : scopeFields.find(([field]) => field === key)?.[1] ?? key}: ${valueText(item)}`).join(' · ') : 'Область не задана — только контекст'
 }
 
 function dateInputValue(value: unknown): string {
@@ -512,23 +516,23 @@ function dateInputValue(value: unknown): string {
   return new Date(timestamp - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16)
 }
 
-function PolicyHistory({ id, onClose }: { id: string; onClose: () => void }) {
-  const { data, loading, error, reload } = useResource(`/exceptions/${encodeURIComponent(id)}/history`)
+function PolicyHistory({ id, onClose, basePath = '/exceptions' }: { id: string; onClose: () => void; basePath?: string }) {
+  const { data, loading, error, reload } = useResource(`${basePath}/${encodeURIComponent(id)}/history`)
   const history = asRecord(data)
   const versions = records(history.versions)
   const events = records(history.events)
   return <Panel title="История политики" aside={<button className="button button--small button--secondary" onClick={onClose}>Закрыть историю</button>}>{error && <ErrorState message={error} retry={reload} />}{loading && !data ? <Loading /> : <><p className="panel-intro">Ключ политики: {valueText(history.policy_key)}</p><h3 className="subheading">Версии</h3><div className="simple-list">{versions.map(item => <div className="simple-row" key={valueText(item.id)}><div><strong>Версия {valueText(item.version)} · {valueText(item.rule_id)}</strong><small>{valueText(item.change_reason)} · {dateText(item.created_at)}</small><small>{scopeText(item.scope)}</small></div><Badge value={item.approval_status} /></div>)}</div><h3 className="subheading">События</h3>{events.length ? <ol className="policy-events">{events.map(item => <li key={valueText(item.id)}><time>{dateText(item.created_at)}</time><strong>{statusLabel(item.event_type)} · {valueText(item.actor)}</strong><span>{valueText(item.from_status, 'Создание')} → {statusLabel(item.to_status)}</span></li>)}</ol> : <p className="panel-intro">Событий пока нет.</p>}</>}</Panel>
 }
 
-function PolicyCard({ item, role, latest, onChanged, onVersion, onHistory }: { item: JsonRecord; role: string; latest: boolean; onChanged: () => void; onVersion: (item: JsonRecord) => void; onHistory: (id: string) => void }) {
+function PolicyCard({ item, role, latest, onChanged, onVersion, onHistory, basePath = '/exceptions' }: { item: JsonRecord; role: string; latest: boolean; onChanged: () => void; onVersion: (item: JsonRecord) => void; onHistory: (id: string) => void; basePath?: string }) {
   const id = valueText(item.id)
   const [revokeReason, setRevokeReason] = useState('')
   const [showRevoke, setShowRevoke] = useState(false)
   const mutation = useMutation()
-  const approve = () => void mutation.run(() => api(`/exceptions/${encodeURIComponent(id)}/approve`, { method: 'POST' }), 'Политика утверждена отдельным согласующим.', onChanged)
+  const approve = () => void mutation.run(() => api(`${basePath}/${encodeURIComponent(id)}/approve`, { method: 'POST' }), 'Политика утверждена отдельным согласующим.', onChanged)
   const revoke = async (event: FormEvent) => {
     event.preventDefault()
-    const ok = await mutation.run(() => api(`/exceptions/${encodeURIComponent(id)}/revoke`, { method: 'POST', body: body({ reason: revokeReason.trim() }) }), 'Утверждение отозвано.', onChanged)
+    const ok = await mutation.run(() => api(`${basePath}/${encodeURIComponent(id)}/revoke`, { method: 'POST', body: body({ reason: revokeReason.trim() }) }), 'Утверждение отозвано.', onChanged)
     if (ok) { setShowRevoke(false); setRevokeReason('') }
   }
   return <article className="policy-row"><div className="policy-row__head"><div><strong>{valueText(item.entity)} · {valueText(item.rule_id)}</strong><small>Версия {valueText(item.version)} · автор {valueText(item.created_by)} · владелец {valueText(item.owner)}</small></div><Badge value={item.approval_status} /></div><p>{valueText(item.reason)}</p><small>{scopeText(item.scope)}</small><small>С {dateText(item.valid_from)} до {dateText(item.valid_until)}</small>{item.approval_status === 'approved' && (dateValue(item.valid_until) ?? Infinity) < Date.now() && <Badge value="expired" />}
@@ -633,6 +637,102 @@ function Contexts({ user }: { user: JsonRecord }) {
         {admin && <form className="inline-form" onSubmit={addMaintenance}><h3>Добавить работу</h3><div className="form-grid"><Field label="Название"><input required value={workTitle} onChange={event => setWorkTitle(event.target.value)} /></Field><Field label="Сущность"><input required value={workEntity} onChange={event => setWorkEntity(event.target.value)} placeholder="IP, хост или пользователь" /></Field><Field label="Основание"><input required value={workReason} onChange={event => setWorkReason(event.target.value)} /></Field><Field label="Начало"><input type="datetime-local" required value={startsAt} onChange={event => setStartsAt(event.target.value)} /></Field><Field label="Конец"><input type="datetime-local" required min={startsAt} value={endsAt} onChange={event => setEndsAt(event.target.value)} /></Field></div><ScopeEditor scope={maintenanceScope} onChange={setMaintenanceScope} /><button className="button button--secondary" disabled={maintenanceMutation.busy}>Сохранить работу</button><Notice flash={maintenanceMutation.flash} /></form>}
       </Panel>
     </div>{historyId && <PolicyHistory key={historyId} id={historyId} onClose={() => setHistoryId('')} />}</>
+}
+
+const suppressionPath = '/suppression-policies'
+const suppressionScopeFields = [
+  ['peer', 'VPN peer'], ['device', 'Устройство'], ['tunnel', 'Туннель'], ['failure_reason', 'Причина ошибки'],
+] as const
+
+function SuppressionPolicies({ user }: { user: JsonRecord }) {
+  const { data, loading, error, reload } = useResource(suppressionPath)
+  const list = records(data)
+  const role = valueText(user.role).toLowerCase()
+  const admin = role === 'admin'
+  const mutation = useMutation()
+  const [versionSource, setVersionSource] = useState<JsonRecord | null>(null)
+  const [historyId, setHistoryId] = useState('')
+  const [owner, setOwner] = useState(valueText(user.username, ''))
+  const [reason, setReason] = useState('')
+  const [changeReason, setChangeReason] = useState('')
+  const [scope, setScope] = useState<Record<string, string>>({})
+  const [validFrom, setValidFrom] = useState('')
+  const [validUntil, setValidUntil] = useState('')
+  const [validation, setValidation] = useState('')
+  const latestByKey = new Map<string, number>()
+  for (const item of list) {
+    const key = valueText(item.policy_key)
+    latestByKey.set(key, Math.max(latestByKey.get(key) ?? 0, Number(item.version) || 0))
+  }
+  const clearForm = () => {
+    setVersionSource(null); setOwner(valueText(user.username, '')); setReason(''); setChangeReason('')
+    setScope({}); setValidFrom(''); setValidUntil(''); setValidation('')
+  }
+  const startVersion = (item: JsonRecord) => {
+    setVersionSource(item)
+    setOwner(valueText(item.owner, ''))
+    setReason(valueText(item.reason, ''))
+    setChangeReason('')
+    setScope(Object.fromEntries(Object.entries(asRecord(item.scope)).map(([key, value]) => [key, valueText(value, '')])))
+    setValidFrom(dateInputValue(item.valid_from))
+    setValidUntil(dateInputValue(item.valid_until))
+    setValidation('')
+    window.requestAnimationFrame(() => document.getElementById('suppression-editor')?.scrollIntoView({ block: 'start' }))
+  }
+  const save = async (event: FormEvent) => {
+    event.preventDefault()
+    setValidation('')
+    const starts = new Date(validFrom).getTime()
+    const ends = new Date(validUntil).getTime()
+    if (!Number.isFinite(starts) || !Number.isFinite(ends) || ends <= starts || ends - starts > 30 * 24 * 60 * 60 * 1000) {
+      setValidation('Укажите период после начала действия, не длиннее 30 дней.')
+      return
+    }
+    const exactScope = Object.fromEntries(suppressionScopeFields.map(([key]) => [key, (scope[key] ?? '').trim()]))
+    if (Object.values(exactScope).some(value => !value || value.includes('*'))) {
+      setValidation('Заполните все четыре поля области точными значениями без символа *.')
+      return
+    }
+    const payload: JsonRecord = {
+      rule: 'ipsec_failure', entity: exactScope.peer, owner: owner.trim(), reason: reason.trim(),
+      change_reason: changeReason.trim(), scope: exactScope,
+      valid_from: new Date(starts).toISOString(), valid_until: new Date(ends).toISOString(),
+    }
+    const endpoint = versionSource ? `${suppressionPath}/${encodeURIComponent(valueText(versionSource.id))}/versions` : suppressionPath
+    const ok = await mutation.run(() => api(endpoint, { method: 'POST', body: body(payload) }),
+      versionSource ? 'Новая версия подавления сохранена как черновик.' : 'Черновик подавления сохранён.', reload)
+    if (ok) clearForm()
+  }
+  return <><PageHead title="Подавление шума" description="Подавление NOISE требует отдельного утверждения и действует только в точной области." actions={<button className="button button--secondary" onClick={reload}>Обновить</button>} />
+    <div className="policy-callout suppression-callout"><strong>Условия применения</strong><p>Только правило ipsec_failure, низкая или средняя критичность и совпадение четырёх полей. Нужны действующие инвентарь и согласованная работа; при кейсе, конфликте или ошибке интеграции подавление запрещено. Состояние меняется локально, внешний кейс и алерт не закрываются. В CONNECTED дополнительно требуются проверка TheHive и разрешение действия на сервере.</p></div>
+    <Panel title="Политики подавления" aside={<span className="quiet">{list.length} версий</span>}>
+      {error && <ErrorState message={error} retry={reload} />}
+      {loading && !data ? <Loading /> : list.length ? <div className="policy-list">{list.map(item => <PolicyCard
+        key={valueText(item.id)} item={item} role={role} basePath={suppressionPath}
+        latest={Number(item.version) === latestByKey.get(valueText(item.policy_key))}
+        onChanged={reload} onVersion={startVersion} onHistory={setHistoryId} />)}</div>
+        : <Empty title="Политик нет" detail="Решение NOISE само по себе не создаёт политику подавления." />}
+    </Panel>
+    {admin && <Panel title={versionSource ? 'Новая версия политики' : 'Предложить подавление'}>
+      <form id="suppression-editor" className="form-stack" onSubmit={save}>
+        <p className="panel-intro">Черновик не действует. Утвердить его должен другой пользователь с ролью согласующего политик.</p>
+        <div className="form-grid">
+          <Field label="Правило"><input value="ipsec_failure" readOnly /></Field>
+          <Field label="Сущность"><input value={scope.peer ?? ''} readOnly placeholder="Заполнится из поля VPN peer" /></Field>
+          <Field label="Владелец"><input required maxLength={100} value={owner} onChange={event => setOwner(event.target.value)} /></Field>
+          <Field label="Основание"><input required minLength={10} maxLength={2000} value={reason} onChange={event => setReason(event.target.value)} /></Field>
+          <Field label="Действует с"><input type="datetime-local" required value={validFrom} onChange={event => setValidFrom(event.target.value)} /></Field>
+          <Field label="Действует до"><input type="datetime-local" required min={validFrom} value={validUntil} onChange={event => setValidUntil(event.target.value)} /></Field>
+        </div>
+        <fieldset className="scope-editor"><legend>Точная область действия</legend><p className="field__hint">Все четыре значения обязательны и должны совпадать с полями события. Подстановочные символы запрещены.</p><div className="form-grid">{suppressionScopeFields.map(([key, label]) => <Field key={key} label={label}><input required maxLength={256} value={scope[key] ?? ''} onChange={event => setScope(current => ({ ...current, [key]: event.target.value }))} /></Field>)}</div></fieldset>
+        <Field label="Причина предложения или изменения"><textarea required minLength={versionSource ? 10 : 3} maxLength={1000} rows={2} value={changeReason} onChange={event => setChangeReason(event.target.value)} /></Field>
+        {validation && <div className="form-error" role="alert">{validation}</div>}
+        <div className="policy-row__actions"><button className="button button--secondary" disabled={mutation.busy}>{mutation.busy ? 'Сохранение…' : versionSource ? 'Создать новую версию' : 'Создать черновик'}</button>{versionSource && <button type="button" className="button button--quiet" onClick={clearForm}>Отмена</button>}</div>
+        <Notice flash={mutation.flash} />
+      </form>
+    </Panel>}
+    {historyId && <PolicyHistory key={historyId} basePath={suppressionPath} id={historyId} onClose={() => setHistoryId('')} />}
+  </>
 }
 
 const assetKinds = ['host', 'ip', 'user', 'vpn_peer', 'device'] as const
@@ -972,6 +1072,42 @@ function DeadLetters({ user }: { user: JsonRecord }) {
   })}</tbody></table></div> : <Empty title="Ошибочных задач нет" detail="Это состояние относится только к очереди ошибок; состояние поступления логов проверяется отдельно." />}</Panel>}</>
 }
 
+function QuarantineDetail({ id, onClose }: { id: string; onClose: () => void }) {
+  const { data, loading, error, reload } = useResource(`/ingestion-quarantine/${encodeURIComponent(id)}`)
+  const item = asRecord(data)
+  return <Panel title="Исходная строка карантина" aside={<button className="button button--small button--secondary" onClick={onClose}>Закрыть</button>}>
+    {error && <ErrorState message={error} retry={reload} />}
+    {loading && !data ? <Loading /> : data !== null && <><Meta entries={[
+      { label: 'Источник', value: valueText(item.source) },
+      { label: 'ID события', value: valueText(item.source_event_id) },
+      { label: 'Тип ошибки', value: valueText(item.error_type) },
+      { label: 'Причина', value: valueText(item.reason) },
+      { label: 'SHA-256 исходной строки', value: valueText(item.raw_sha256) },
+      { label: 'Исходный размер', value: `${valueText(item.raw_bytes)} байт` },
+    ]} />
+      {item.raw_truncated === true && <p className="panel-intro">Сохранённый текст усечён; SHA-256 вычислен по исходной строке целиком.</p>}
+      <h3 className="subheading">Сохранённый исходный JSON</h3>
+      <pre className="evidence-data quarantine-raw">{valueText(item.raw_json, 'Исходная строка не сохранена')}</pre>
+    </>}
+  </Panel>
+}
+
+function IngestionQuarantine() {
+  const { data, loading, error, reload } = useResource('/ingestion-quarantine?limit=100')
+  const list = records(data)
+  const [selectedId, setSelectedId] = useState('')
+  return <><PageHead title="Карантин приёма" description="Некорректные строки Splunk сохраняются отдельно для разбора администратором." actions={<button className="button button--secondary" onClick={reload}>Обновить</button>} />
+    <Panel title="Отклонённые строки" aside={<span className="quiet">{list.length} записей</span>}>
+      {error && <ErrorState message={error} retry={reload} />}
+      {loading && !data ? <Loading /> : list.length ? <div className="table-wrap"><table><thead><tr><th>Источник / ID</th><th>Ошибка</th><th>Повторов</th><th>Последний раз</th><th>Размер</th><th></th></tr></thead><tbody>{list.map((item, index) => {
+        const id = valueText(item.id, String(index))
+        return <tr key={id}><td><strong>{valueText(item.source)}</strong><small className="cell-sub">{valueText(item.source_event_id)}</small></td><td>{valueText(item.error_type)}</td><td className="number">{valueText(item.occurrences)}</td><td className="number">{dateText(item.last_seen_at)}</td><td className="number">{valueText(item.raw_bytes)} байт{item.raw_truncated === true ? ' · усечено' : ''}</td><td><button className="button button--small button--secondary" aria-expanded={selectedId === id} onClick={() => setSelectedId(current => current === id ? '' : id)}>{selectedId === id ? 'Скрыть' : 'Открыть'}</button></td></tr>
+      })}</tbody></table></div> : <Empty title="Карантин пуст" detail="Сохранённых отклонённых строк нет. Состояние полноты опроса проверьте отдельно в интеграциях." />}
+    </Panel>
+    {selectedId && <QuarantineDetail key={selectedId} id={selectedId} onClose={() => setSelectedId('')} />}
+  </>
+}
+
 export default function App() {
   const [user, setUser] = useState<JsonRecord | null>(null)
   const [checking, setChecking] = useState(true)
@@ -997,6 +1133,7 @@ export default function App() {
     if (path === '/alerts') return <Alerts user={user} />
     if (path.startsWith('/investigations/')) return <Investigation id={decodeURIComponent(path.split('/')[2] || '')} user={user} />
     if (path === '/contexts') return <Contexts user={user} />
+    if (path === '/suppression') return <SuppressionPolicies user={user} />
     if (path === '/assets') return <Assets user={user} />
     if (path === '/metrics' && user.role === 'admin') return <Metrics />
     if (path === '/integrations') return <Integrations user={user} />
@@ -1007,6 +1144,7 @@ export default function App() {
     if (path === '/users' && user.role === 'admin') return <Users />
     if (path === '/scenarios' && valueText(user.mode).toLowerCase() === 'demo') return <Scenarios user={user} />
     if (path === '/dead-letters') return <DeadLetters user={user} />
+    if (path === '/ingestion-quarantine' && user.role === 'admin') return <IngestionQuarantine />
     return <><PageHead title="Страница не найдена" description="Проверьте адрес или вернитесь к рабочей очереди." /><Link className="button button--primary" to="/">К обзору</Link></>
   }, [path, user])
   if (checking) return <div className="startup"><Loading /></div>

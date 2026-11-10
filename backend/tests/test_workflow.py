@@ -145,6 +145,29 @@ def test_ingest_rejects_timestamp_without_offset():
             ingest(db, owner.id, payload)
 
 
+def test_evidence_collection_uses_rule_specific_splunk_search(monkeypatch):
+    import app.workflow as workflow
+
+    calls = []
+
+    class RuleAwareSplunk:
+        def related_events_for_rule(self, rule, entity, earliest, latest):
+            calls.append((rule, entity, earliest, latest))
+            return []
+
+        def related_events(self, *_):
+            pytest.fail("The generic query must not replace the configured rule query")
+
+    monkeypatch.setattr(workflow, "splunk_adapter", RuleAwareSplunk)
+    with Session(database()) as db:
+        owner = tenant(db, level="observe")
+        alert, _ = ingest(db, owner.id, instantiate_scenario("root_missing_context")[0])
+        inv = db.get(Investigation, alert.investigation_id)
+        workflow.collect(db, alert, inv)
+    assert len(calls) == 1
+    assert calls[0][0] == "root_ssh" and calls[0][1] == "demo-app-03"
+
+
 def test_linked_alerts_are_preserved_without_duplicate_case():
     with Session(database()) as db:
         owner = tenant(db)

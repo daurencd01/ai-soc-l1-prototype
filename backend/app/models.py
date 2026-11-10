@@ -52,6 +52,21 @@ class Alert(Base):
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
+    normalized: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class AlertFingerprint(Base):
+    """Active tenant-scoped deduplication claim; expired claims can be reused."""
+
+    __tablename__ = "alert_fingerprints"
+    __table_args__ = (UniqueConstraint("tenant_id", "fingerprint"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    alert_id: Mapped[str] = mapped_column(ForeignKey("alerts.id"), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class EmbeddedEvent(Base):
@@ -247,6 +262,52 @@ class PolicyEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class SuppressionRule(Base):
+    """Separately approved policy for grouping one bounded NOISE fingerprint."""
+    __tablename__ = "suppression_rules"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "policy_key", "version", name="uq_suppression_tenant_policy_version"),
+        Index("uq_suppression_one_approved_version", "tenant_id", "policy_key", unique=True,
+              sqlite_where=text("approval_status = 'approved'"),
+              postgresql_where=text("approval_status = 'approved'")),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    policy_key: Mapped[str] = mapped_column(String(36), default=uid)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    rule: Mapped[str] = mapped_column(String(100))
+    entity: Mapped[str] = mapped_column(String(256))
+    owner: Mapped[str] = mapped_column(String(100))
+    created_by: Mapped[str] = mapped_column(String(100))
+    reason: Mapped[str] = mapped_column(Text)
+    scope: Mapped[dict] = mapped_column(JSON)
+    valid_from: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    valid_until: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    approval_status: Mapped[str] = mapped_column(String(20), default="draft")
+    approved_by: Mapped[str] = mapped_column(String(100), default="")
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    change_reason: Mapped[str] = mapped_column(Text)
+    revocation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SuppressionEvent(Base):
+    """Append-only approval trail for a NOISE suppression policy version."""
+    __tablename__ = "suppression_events"
+    __table_args__ = (Index("ix_suppression_events_tenant_policy_time", "tenant_id", "policy_id", "created_at"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    policy_id: Mapped[str] = mapped_column(ForeignKey("suppression_rules.id"), index=True)
+    actor: Mapped[str] = mapped_column(String(100))
+    event_type: Mapped[str] = mapped_column(String(30))
+    from_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    to_status: Mapped[str] = mapped_column(String(20))
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class Maintenance(Base):
     __tablename__ = "maintenance"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
@@ -330,6 +391,26 @@ class Checkpoint(Base):
     source: Mapped[str] = mapped_column(String(60))
     cursor_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class IngestionQuarantine(Base):
+    """Durable evidence of a source row rejected by alert normalization."""
+
+    __tablename__ = "ingestion_quarantine"
+    __table_args__ = (UniqueConstraint("tenant_id", "source", "source_event_id"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    source: Mapped[str] = mapped_column(String(50))
+    source_event_id: Mapped[str] = mapped_column(String(256))
+    raw_json: Mapped[str] = mapped_column(Text)
+    raw_sha256: Mapped[str] = mapped_column(String(64))
+    raw_bytes: Mapped[int] = mapped_column(Integer)
+    raw_truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+    error_type: Mapped[str] = mapped_column(String(100))
+    reason: Mapped[str] = mapped_column(String(500))
+    occurrences: Mapped[int] = mapped_column(Integer, default=1)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class DeadLetter(Base):

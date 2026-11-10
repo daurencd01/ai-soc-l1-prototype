@@ -41,9 +41,16 @@ services:
       CONNECTED_WRITES_ENABLED: ${CONNECTED_WRITES_ENABLED:-false}
       CONNECTED_ALLOWED_ACTIONS: ${CONNECTED_ALLOWED_ACTIONS:-}
       AUTO_CLOSE_ENABLED: ${AUTO_CLOSE_ENABLED:-false}
+      FINGERPRINT_TTL_SECONDS: ${FINGERPRINT_TTL_SECONDS:-86400}
+      CORRELATION_WINDOW_SECONDS: ${CORRELATION_WINDOW_SECONDS:-900}
       SPLUNK_BASE_URL: ${SPLUNK_BASE_URL:-}
       SPLUNK_TOKEN: ${SPLUNK_TOKEN:-}
       SPLUNK_SEARCH_TEMPLATE: ${SPLUNK_SEARCH_TEMPLATE:-search index=main earliest={earliest} latest={latest} | head 200}
+      SPLUNK_RULE_TEMPLATES_JSON: ${SPLUNK_RULE_TEMPLATES_JSON:-{}}
+      SPLUNK_SEARCH_TIMEOUT_SECONDS: ${SPLUNK_SEARCH_TIMEOUT_SECONDS:-30}
+      SPLUNK_MAX_CONCURRENT_SEARCHES: ${SPLUNK_MAX_CONCURRENT_SEARCHES:-2}
+      SPLUNK_PAGE_SIZE: ${SPLUNK_PAGE_SIZE:-100}
+      SPLUNK_MAX_WINDOW_SECONDS: ${SPLUNK_MAX_WINDOW_SECONDS:-86400}
       SPLUNK_POLL_SECONDS: ${SPLUNK_POLL_SECONDS:-60}
       SPLUNK_OVERLAP_SECONDS: ${SPLUNK_OVERLAP_SECONDS:-120}
       THEHIVE_BASE_URL: ${THEHIVE_BASE_URL:-}
@@ -80,7 +87,7 @@ services:
     build: ./backend
     restart: unless-stopped
     networks: [back]
-    command: ["celery", "-A", "app.tasks:celery_app", "beat", "--loglevel=INFO"]
+    command: ["celery", "-A", "app.tasks:celery_app", "beat", "--loglevel=INFO", "--schedule=/tmp/celerybeat-schedule"]
     environment: *backend_env
     depends_on:
       backend: {condition: service_healthy}

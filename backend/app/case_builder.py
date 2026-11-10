@@ -45,7 +45,7 @@ class CasePlan:
     """
 
     create_case: dict[str, Any]
-    steps: tuple[tuple[str, dict[str, str]], ...]
+    steps: tuple[tuple[str, dict[str, Any]], ...]
     metadata: dict[str, Any]
 
 
@@ -289,8 +289,12 @@ def build_case_plan(
 
     tasks = [{"title": "Проверить и принять эскалацию SOC L1"}]
     tasks.extend({"title": f"Проверить: {item}"[:380]} for item in missing[:4])
-    steps: tuple[tuple[str, dict[str, str]], ...] = (
+    steps: tuple[tuple[str, dict[str, Any]], ...] = (
         ("evidence_page", {"title": "Хронология и доказательства SOC L1", "category": "SOC L1", "content": page_content}),
+        ("comment", {"message": (f"SOC L1: кейс создан по эскалации расследования "
+                                f"{_plain(investigation_id, 80)}. Классификация: {classification}; "
+                                f"приоритет: {priority}. Подробности и ссылки на доказательства "
+                                "сохранены в описании и странице хронологии."), "external": False}),
         *(("observable", item) for item in observables),
         *(("task", item) for item in tasks),
     )

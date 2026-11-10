@@ -7,28 +7,36 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 from zoneinfo import ZoneInfo
+from uuid import uuid4
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from .adapters import AdapterError, validate_case_fields
 from .config import settings
 from .db import SessionLocal, get_db
 from .classification import Classification, action_lane, classification_for_lane
 from .metrics import metric_snapshot
+from .observability import log_event
 from .models import (Action, Alert, Asset, Audit, Case, CaseWrite, DeadLetter, Decision, Evidence,
                      ExceptionRule, IntegrationState, Investigation, Maintenance, MispNotice, PlaybookRun, PolicyEvent,
-                     PipelineTransition, Report, Shift, Tenant, User, utcnow)
+                     PipelineTransition, Report, Shift, SuppressionEvent, SuppressionRule, Tenant, User,
+                     IngestionQuarantine, utcnow)
 from .playbooks import REGISTRY
 from .policy import aware as policy_aware, record_event, validate_contract
+from .request_limits import login_limiter, read_bounded_body
 from .report import build_report, export_docx_bytes, export_txt_bytes, next_report_version
 from .security import (admin, analyst, audit, current_user, hash_password, policy_approver,
-                       policy_revoker, token_for, verify_password)
+                       policy_revoker, token_for, validate_runtime_secrets, verify_password)
 from .state import PipelineState, move_alert
+from .suppression import (record_event as record_suppression_event,
+                          validate_contract as validate_suppression_contract)
 from .tasks import celery_app, check_integrations, dispatch
 from .workflow import (ManualCloseDenied, aware, ingest, manual_close_gate,
-                       perform_action, reconcile_case_status, update_case_status)
+                       perform_action, reconcile_case_fields, reconcile_case_status,
+                       update_case_fields, update_case_status)
 
 
 def seed() -> None:
@@ -66,6 +74,7 @@ def seed() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    validate_runtime_secrets(settings().mode, settings().jwt_secret, settings().webhook_secret)
     seed()
     yield
 
@@ -73,6 +82,29 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Sauyt.Lab AI SOC L1", version="0.1.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
                    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+
+@app.middleware("http")
+async def structured_request_log(request: Request, call_next):
+    correlation_id = uuid4().hex
+    request.state.correlation_id = correlation_id
+    method = request.method if request.method in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"} else "<invalid>"
+
+    def route_template() -> str:
+        route = request.scope.get("route")
+        path = getattr(route, "path", None)
+        return path if isinstance(path, str) and len(path) <= 200 else "<unmatched>"
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        log_event("http_request", correlation_id=correlation_id, method=method,
+                  route=route_template(), http_status=500)
+        raise
+    response.headers["X-Request-ID"] = correlation_id
+    log_event("http_request", correlation_id=correlation_id, method=method,
+              route=route_template(), http_status=response.status_code)
+    return response
 
 
 class LoginIn(BaseModel):
@@ -137,6 +169,16 @@ class CaseStatusIn(BaseModel):
     status: str = Field(min_length=1, max_length=64)
 
 
+class CaseFieldsIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str | None = Field(default=None, min_length=1, max_length=512)
+    description: str | None = Field(default=None, min_length=1, max_length=1_048_576)
+    summary: str | None = Field(default=None, min_length=1, max_length=1_048_576)
+    severity: int | None = Field(default=None, ge=1, le=4, strict=True)
+    startDate: int | None = Field(default=None, gt=0, strict=True)
+    endDate: int | None = Field(default=None, gt=0, strict=True)
+
+
 class AssetIn(BaseModel):
     kind: Literal["host", "ip", "user", "vpn_peer", "device"]
     value: str = Field(min_length=1, max_length=256)
@@ -156,6 +198,14 @@ def serialize(row, keys: tuple[str, ...]) -> dict:
 
 
 def exception_view(row: ExceptionRule) -> dict:
+    return {**serialize(row, ("id", "policy_key", "version", "rule", "entity", "owner", "created_by",
+                              "reason", "scope", "valid_from", "valid_until", "approval_status",
+                              "approved_by", "approved_at", "revoked_by", "revoked_at",
+                              "change_reason", "revocation_reason", "created_at")),
+            "rule_id": row.rule}
+
+
+def suppression_view(row: SuppressionRule) -> dict:
     return {**serialize(row, ("id", "policy_key", "version", "rule", "entity", "owner", "created_by",
                               "reason", "scope", "valid_from", "valid_until", "approval_status",
                               "approved_by", "approved_at", "revoked_by", "revoked_at",
@@ -205,9 +255,11 @@ def ready(db: Session = Depends(get_db)):
 
 
 @app.post("/api/auth/login")
-def login(data: LoginIn, db: Session = Depends(get_db)):
+def login(data: LoginIn, request: Request, db: Session = Depends(get_db)):
+    login_limiter.assert_allowed(data.username)
     user = db.scalar(select(User).where(User.username == data.username, User.active.is_(True)))
     if not user or not verify_password(data.password, user.password_hash):
+        login_limiter.record_failure(data.username)
         raise HTTPException(401, "Неверные учётные данные")
     audit(db, user.tenant_id, user.username, "login", "user", user.id)
     db.commit()
@@ -292,7 +344,8 @@ def alerts(status: str | None = None, verdict: str | None = None,
         query = query.where(Alert.title.ilike(f"%{search[:100]}%"))
     rows = db.execute(query.order_by(Alert.received_at.desc()).limit(min(max(limit, 1), 500))).all()
     return {"items": [{**serialize(a, ("id", "title", "rule", "severity", "status", "pipeline_state",
-                                    "event_at", "received_at", "source", "source_event_id", "investigation_id")),
+                                    "event_at", "received_at", "source", "source_event_id", "investigation_id",
+                                    "fingerprint")),
                        "verdict": v, "classification": c, "confidence": confidence}
                       for a, v, c, confidence in rows], "total": len(rows)}
 
@@ -300,11 +353,11 @@ def alerts(status: str | None = None, verdict: str | None = None,
 @app.get("/api/investigations/{investigation_id}")
 def investigation(investigation_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     inv = scoped(db, Investigation, user.tenant_id, investigation_id)
-    return {**serialize(inv, ("id", "status", "verdict", "classification", "confidence",
+    return {**serialize(inv, ("id", "correlation_key", "status", "verdict", "classification", "confidence",
                               "priority", "summary", "rationale", "missing_data",
                               "recommended_actions", "playbook_key", "playbook_version", "analyzer", "created_at", "started_at", "completed_at", "due_at")),
             "alerts": [serialize(x, ("id", "source_event_id", "title", "rule", "status", "pipeline_state",
-                                     "event_at", "received_at", "raw"))
+                                     "event_at", "received_at", "fingerprint", "normalized", "raw"))
                        for x in db.scalars(select(Alert).where(Alert.tenant_id == user.tenant_id, Alert.investigation_id == inv.id)).all()],
             "transitions": [serialize(x, ("id", "alert_id", "from_state", "to_state", "actor", "reason", "created_at"))
                             for x in db.scalars(select(PipelineTransition).where(
@@ -347,11 +400,13 @@ def review(investigation_id: str, body: ReviewIn, user: User = Depends(analyst),
     inv.verdict, inv.classification, inv.confidence, inv.rationale = verdict, classification, None, body.note
     inv.status = "needs_review" if verdict == "needs_review" else "completed"
     inv.completed_at = utcnow()
-    if inv.status == "needs_review":
-        for alert in db.scalars(select(Alert).where(Alert.tenant_id == user.tenant_id,
-                                                   Alert.investigation_id == inv.id)).all():
-            if alert.pipeline_state == PipelineState.TRIAGED:
-                move_alert(db, alert, PipelineState.NEEDS_REVIEW, user.username, "manual_review")
+    for alert in db.scalars(select(Alert).where(Alert.tenant_id == user.tenant_id,
+                                               Alert.investigation_id == inv.id)).all():
+        if alert.pipeline_state == PipelineState.SUPPRESSED and classification != "NOISE":
+            move_alert(db, alert, PipelineState.NEEDS_REVIEW, user.username, "manual_suppression_reversal")
+            alert.status = "needs_review"
+        elif inv.status == "needs_review" and alert.pipeline_state == PipelineState.TRIAGED:
+            move_alert(db, alert, PipelineState.NEEDS_REVIEW, user.username, "manual_review")
     audit(db, user.tenant_id, user.username, "review", "investigation", inv.id,
           {"verdict": verdict, "classification": classification})
     db.commit()
@@ -419,6 +474,29 @@ def set_case_status(case_id: str, body: CaseStatusIn, user: User = Depends(admin
         raise HTTPException(422, str(exc))
     except Exception:
         raise HTTPException(503, "TheHive недоступен для обновления статуса")
+    return serialize(action, ("id", "status", "external_id", "detail"))
+
+
+@app.patch("/api/cases/{case_id}/fields")
+def set_case_fields(case_id: str, body: CaseFieldsIn, user: User = Depends(admin), db: Session = Depends(get_db)):
+    case = db.scalar(select(Case).where(Case.tenant_id == user.tenant_id, Case.id == case_id).with_for_update())
+    if not case:
+        raise HTTPException(404, "Объект не найден")
+    tenant = db.get(Tenant, user.tenant_id)
+    if tenant.automation_level not in {"controlled_automation", "approved_response"} or not can_manual_action(tenant, "update_case"):
+        raise HTTPException(403, "Обновление кейса не разрешено политикой")
+    if not case.external_id:
+        raise HTTPException(409, "Кейс ещё не подтверждён во внешней системе")
+    try:
+        changes = validate_case_fields(body.model_dump(exclude_unset=True))
+    except AdapterError as exc:
+        raise HTTPException(422, str(exc))
+    try:
+        action = update_case_fields(db, tenant, case, changes, user.username)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    except Exception:
+        raise HTTPException(503, "TheHive недоступен для обновления кейса")
     return serialize(action, ("id", "status", "external_id", "detail"))
 
 
@@ -612,6 +690,140 @@ def exception_history(exception_id: str, user: User = Depends(current_user), db:
                                     "to_status", "detail", "created_at")) for x in events]}
 
 
+@app.get("/api/suppression-policies")
+def suppression_policies(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    rows = db.scalars(select(SuppressionRule).where(SuppressionRule.tenant_id == user.tenant_id)
+                      .order_by(SuppressionRule.created_at.desc(), SuppressionRule.version.desc()).limit(300)).all()
+    return {"items": [suppression_view(row) for row in rows]}
+
+
+@app.post("/api/suppression-policies")
+def create_suppression_policy(body: WindowIn, user: User = Depends(admin), db: Session = Depends(get_db)):
+    valid_from, valid_until = checked_window(body.valid_from, body.valid_until)
+    row = SuppressionRule(tenant_id=user.tenant_id, rule=body.rule.strip(), entity=body.entity.strip(),
+                          owner=(body.owner or user.username).strip(), created_by=user.username,
+                          reason=body.reason.strip(), scope=body.scope, valid_from=valid_from,
+                          valid_until=valid_until, approval_status="draft", approved_by="",
+                          change_reason=body.change_reason.strip())
+    db.add(row)
+    db.flush()
+    record_suppression_event(db, row, user.username, "proposed", None, "draft")
+    audit(db, user.tenant_id, user.username, "suppression_proposed", "suppression_policy", row.id,
+          {"policy_key": row.policy_key, "version": row.version, "rule_id": row.rule})
+    db.commit()
+    return suppression_view(row)
+
+
+@app.post("/api/suppression-policies/{policy_id}/versions")
+def create_suppression_version(policy_id: str, body: PolicyVersionIn,
+                               user: User = Depends(admin), db: Session = Depends(get_db)):
+    if len(body.change_reason.strip()) < 10:
+        raise HTTPException(422, "Укажите причину изменения политики")
+    source = scoped(db, SuppressionRule, user.tenant_id, policy_id)
+    latest = db.scalar(select(SuppressionRule).where(SuppressionRule.tenant_id == user.tenant_id,
+        SuppressionRule.policy_key == source.policy_key).order_by(SuppressionRule.version.desc())
+        .with_for_update().limit(1))
+    if source.id != latest.id:
+        raise HTTPException(409, "Новая версия создаётся от последней версии политики")
+    valid_from, valid_until = checked_window(body.valid_from, body.valid_until)
+    row = SuppressionRule(tenant_id=user.tenant_id, policy_key=source.policy_key, version=source.version + 1,
+                          rule=body.rule.strip(), entity=body.entity.strip(),
+                          owner=(body.owner or source.owner).strip(), created_by=user.username,
+                          reason=body.reason.strip(), scope=body.scope, valid_from=valid_from,
+                          valid_until=valid_until, approval_status="draft", approved_by="",
+                          change_reason=body.change_reason.strip())
+    db.add(row)
+    try:
+        db.flush()
+        record_suppression_event(db, row, user.username, "version_proposed", None, "draft",
+                                 {"previous_version_id": source.id, "change_reason": row.change_reason})
+        audit(db, user.tenant_id, user.username, "suppression_version_proposed", "suppression_policy", row.id,
+              {"policy_key": row.policy_key, "version": row.version, "previous_version_id": source.id})
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Версия политики уже создана")
+    return suppression_view(row)
+
+
+@app.post("/api/suppression-policies/{policy_id}/approve")
+def approve_suppression_policy(policy_id: str, user: User = Depends(policy_approver), db: Session = Depends(get_db)):
+    row = db.scalar(select(SuppressionRule).where(SuppressionRule.tenant_id == user.tenant_id,
+        SuppressionRule.id == policy_id).with_for_update())
+    if not row:
+        raise HTTPException(404, "Объект не найден")
+    if row.approval_status != "draft":
+        raise HTTPException(409, "Утвердить можно только черновик политики")
+    if not row.created_by or row.created_by == user.username:
+        raise HTTPException(403, "Автор не может утвердить собственную политику")
+    latest = db.scalar(select(SuppressionRule.version).where(SuppressionRule.tenant_id == user.tenant_id,
+        SuppressionRule.policy_key == row.policy_key).order_by(SuppressionRule.version.desc()).limit(1))
+    if latest != row.version:
+        raise HTTPException(409, "Есть более новая версия политики")
+    denial = validate_suppression_contract(row)
+    if denial:
+        raise HTTPException(409, f"Политика не может быть утверждена: {denial}")
+    now = utcnow()
+    if policy_aware(row.valid_until) <= now:
+        raise HTTPException(409, "Срок действия политики истёк")
+    previous = db.scalars(select(SuppressionRule).where(SuppressionRule.tenant_id == user.tenant_id,
+        SuppressionRule.policy_key == row.policy_key, SuppressionRule.approval_status == "approved")
+        .with_for_update()).all()
+    for older in previous:
+        older.approval_status = "superseded"
+        older.revoked_at, older.revoked_by = now, user.username
+        older.revocation_reason = f"Superseded by version {row.version}"
+        record_suppression_event(db, older, user.username, "superseded", "approved", "superseded",
+                                 {"new_policy_id": row.id, "new_version": row.version})
+        audit(db, user.tenant_id, user.username, "suppression_superseded", "suppression_policy", older.id,
+              {"new_policy_id": row.id})
+    db.flush()
+    row.approval_status, row.approved_by, row.approved_at = "approved", user.username, now
+    record_suppression_event(db, row, user.username, "approved", "draft", "approved")
+    audit(db, user.tenant_id, user.username, "suppression_approved", "suppression_policy", row.id,
+          {"policy_key": row.policy_key, "version": row.version, "rule_id": row.rule})
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Другая версия уже утверждена")
+    return suppression_view(row)
+
+
+@app.post("/api/suppression-policies/{policy_id}/revoke")
+def revoke_suppression_policy(policy_id: str, body: PolicyRevokeIn,
+                              user: User = Depends(policy_revoker), db: Session = Depends(get_db)):
+    if len(body.reason.strip()) < 10:
+        raise HTTPException(422, "Укажите причину отзыва политики")
+    row = db.scalar(select(SuppressionRule).where(SuppressionRule.tenant_id == user.tenant_id,
+        SuppressionRule.id == policy_id).with_for_update())
+    if not row:
+        raise HTTPException(404, "Объект не найден")
+    if row.approval_status != "approved":
+        raise HTTPException(409, "Отозвать можно только действующее утверждение")
+    row.approval_status, row.revoked_at, row.revoked_by = "revoked", utcnow(), user.username
+    row.revocation_reason = body.reason.strip()
+    record_suppression_event(db, row, user.username, "revoked", "approved", "revoked",
+                             {"reason": row.revocation_reason})
+    audit(db, user.tenant_id, user.username, "suppression_revoked", "suppression_policy", row.id,
+          {"policy_key": row.policy_key, "version": row.version, "reason": row.revocation_reason})
+    db.commit()
+    return suppression_view(row)
+
+
+@app.get("/api/suppression-policies/{policy_id}/history")
+def suppression_history(policy_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    row = scoped(db, SuppressionRule, user.tenant_id, policy_id)
+    versions = db.scalars(select(SuppressionRule).where(SuppressionRule.tenant_id == user.tenant_id,
+        SuppressionRule.policy_key == row.policy_key).order_by(SuppressionRule.version)).all()
+    ids = [item.id for item in versions]
+    events = db.scalars(select(SuppressionEvent).where(SuppressionEvent.tenant_id == user.tenant_id,
+        SuppressionEvent.policy_id.in_(ids)).order_by(SuppressionEvent.created_at, SuppressionEvent.id)).all()
+    return {"policy_key": row.policy_key, "versions": [suppression_view(item) for item in versions],
+            "events": [serialize(item, ("id", "policy_id", "actor", "event_type", "from_status",
+                                        "to_status", "detail", "created_at")) for item in events]}
+
+
 @app.get("/api/maintenance")
 def maintenance(user: User = Depends(current_user), db: Session = Depends(get_db)):
     rows = db.scalars(select(Maintenance).where(Maintenance.tenant_id == user.tenant_id).order_by(Maintenance.valid_until.desc())).all()
@@ -793,6 +1005,24 @@ def dead_letters(user: User = Depends(current_user), db: Session = Depends(get_d
     return {"items": [serialize(x, ("id", "alert_id", "error", "attempts", "status", "created_at")) for x in rows]}
 
 
+@app.get("/api/ingestion-quarantine")
+def ingestion_quarantine(limit: int = 50, user: User = Depends(admin), db: Session = Depends(get_db)):
+    rows = db.scalars(select(IngestionQuarantine).where(IngestionQuarantine.tenant_id == user.tenant_id)
+                      .order_by(IngestionQuarantine.last_seen_at.desc(), IngestionQuarantine.id)
+                      .limit(min(max(limit, 1), 100))).all()
+    return {"items": [serialize(row, ("id", "source", "source_event_id", "raw_sha256", "raw_bytes",
+                                      "raw_truncated", "error_type", "reason", "occurrences",
+                                      "first_seen_at", "last_seen_at")) for row in rows]}
+
+
+@app.get("/api/ingestion-quarantine/{item_id}")
+def ingestion_quarantine_item(item_id: str, user: User = Depends(admin), db: Session = Depends(get_db)):
+    row = scoped(db, IngestionQuarantine, user.tenant_id, item_id)
+    return serialize(row, ("id", "source", "source_event_id", "raw_json", "raw_sha256", "raw_bytes",
+                           "raw_truncated", "error_type", "reason", "occurrences",
+                           "first_seen_at", "last_seen_at"))
+
+
 @app.post("/api/dead-letters/{letter_id}/retry")
 def retry_dead_letter(letter_id: str, user: User = Depends(admin), db: Session = Depends(get_db)):
     letter = scoped(db, DeadLetter, user.tenant_id, letter_id)
@@ -817,6 +1047,13 @@ def reconcile_action(action_id: str, user: User = Depends(admin), db: Session = 
     if action.kind == "update_case":
         case = scoped(db, Case, user.tenant_id, action.target)
         result = reconcile_case_status(db, tenant, action, case, user.username)
+        audit(db, user.tenant_id, user.username, "action_reconcile_requested", "action", action.id,
+              {"outcome": result.status})
+        db.commit()
+        return serialize(result, ("id", "status", "external_id", "detail"))
+    if action.kind == "update_case_fields":
+        case = scoped(db, Case, user.tenant_id, action.target)
+        result = reconcile_case_fields(db, tenant, action, case, user.username)
         audit(db, user.tenant_id, user.username, "action_reconcile_requested", "action", action.id,
               {"outcome": result.status})
         db.commit()
@@ -893,9 +1130,7 @@ async def webhook(tenant_id: str, secret: str, request: Request, x_soc_signature
     expected_token = hmac.new(settings().webhook_secret.encode(), tenant_id.encode(), hashlib.sha256).hexdigest()
     if not db.get(Tenant, tenant_id) or not hmac.compare_digest(secret, expected_token):
         raise HTTPException(401, "Недействительный источник")
-    body = await request.body()
-    if len(body) > 1_000_000:
-        raise HTTPException(413, "Слишком большой запрос")
+    body = await read_bounded_body(request)
     if x_soc_signature:
         signature = hmac.new(settings().webhook_secret.encode(), body, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(x_soc_signature, signature):
@@ -904,6 +1139,8 @@ async def webhook(tenant_id: str, secret: str, request: Request, x_soc_signature
         payload = json.loads(body)
     except ValueError:
         raise HTTPException(400, "Некорректный JSON")
+    if not isinstance(payload, dict):
+        raise HTTPException(422, "Алерт должен быть объектом")
     if "result" in payload and "search_name" in payload:
         result = payload.get("result") or {}
         payload = {"source": "splunk", "source_event_id": str(result.get("_cd") or payload.get("sid") or ""),

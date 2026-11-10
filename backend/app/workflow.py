@@ -8,16 +8,20 @@ from time import monotonic
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from .adapters import AdapterError, splunk_adapter, thehive_adapter, misp_adapter
+from .adapters import (AdapterAmbiguousError, AdapterError, misp_adapter, splunk_adapter,
+                       thehive_adapter, validate_case_fields)
 from .analyzer import model_analyze
 from .case_builder import build_case_plan
 from .config import settings
-from .models import (Action, Alert, Asset, Case, CaseWrite, Decision, EmbeddedEvent, Evidence,
-                     ExceptionRule, IntegrationState, Investigation, Maintenance, PlaybookRun, Tenant, utcnow)
-from .playbooks import select_playbook
+from .ingestion import SecurityAlert, compatible_for_correlation, normalize_alert
+from .models import (Action, Alert, AlertFingerprint, Asset, Audit, Case, CaseWrite, Decision, EmbeddedEvent, Evidence,
+                     ExceptionRule, IntegrationState, Investigation, Maintenance, PlaybookRun,
+                     SuppressionRule, Tenant, utcnow)
+from .playbooks import Verdict, select_playbook
 from .policy import is_effective
 from .security import audit
 from .state import PipelineState, move_alert, record_initial
+from .suppression import is_effective as suppression_is_effective
 
 
 def aware(dt: datetime) -> datetime:
@@ -25,71 +29,143 @@ def aware(dt: datetime) -> datetime:
 
 
 def ingest(db: Session, tenant_id: str, payload: dict, _attempt: int = 0) -> tuple[Alert, bool]:
-    source = str(payload.get("source") or "demo")[:50]
-    source_id = str(payload.get("source_event_id") or "")[:256]
-    if not source_id:
-        raise ValueError("source_event_id обязателен")
-    existing = db.scalar(select(Alert).where(Alert.tenant_id == tenant_id, Alert.source == source, Alert.source_event_id == source_id))
+    config = settings()
+    normalized = normalize_alert(
+        payload, tenant_id, now=utcnow(),
+        fingerprint_ttl_seconds=config.fingerprint_ttl_seconds,
+        correlation_window_seconds=config.correlation_window_seconds,
+    )
+    source, source_id = normalized.alert.source, normalized.alert.event_id
+
+    def duplicate(item: Alert, reason: str) -> tuple[Alert, bool]:
+        audit(db, tenant_id, "ingest", "alert_deduplicated", "alert", item.id,
+              {"source": source, "source_event_id": source_id, "reason": reason})
+        db.commit()
+        return item, False
+
+    existing = db.scalar(select(Alert).where(Alert.tenant_id == tenant_id, Alert.source == source,
+                                             Alert.source_event_id == source_id))
     if existing:
-        audit(db, tenant_id, "ingest", "alert_deduplicated", "alert", existing.id,
-              {"source": source, "source_event_id": source_id})
-        db.commit()
-        return existing, False
-    raw_time = payload["event_at"]
-    source_time = (datetime.fromtimestamp(float(raw_time), timezone.utc) if isinstance(raw_time, (int, float)) or
-                   (isinstance(raw_time, str) and raw_time.replace(".", "", 1).isdigit())
-                   else datetime.fromisoformat(str(raw_time).replace("Z", "+00:00")))
-    if source_time.tzinfo is None or source_time.utcoffset() is None:
-        raise ValueError("event_at должен содержать часовое смещение")
-    event_at = source_time.astimezone(timezone.utc)
-    rule = str(payload.get("rule") or "generic")[:100]
+        return duplicate(existing, "source_event_id")
+
+    def active_fingerprint() -> tuple[AlertFingerprint | None, Alert | None]:
+        claim = db.scalar(select(AlertFingerprint).where(
+            AlertFingerprint.tenant_id == tenant_id,
+            AlertFingerprint.fingerprint == normalized.fingerprint).with_for_update())
+        if claim and aware(claim.expires_at) > normalized.alert.ingestion_time:
+            original = db.get(Alert, claim.alert_id)
+            if original and original.tenant_id == tenant_id:
+                return claim, original
+        return claim, None
+
+    claim, original = active_fingerprint()
+    if original:
+        return duplicate(original, "fingerprint")
+
+    rule = normalized.alert.rule_id or "generic"
     playbook = select_playbook(rule)
-    raw = payload.get("raw") or {}
-    if not isinstance(raw, dict):
-        raise ValueError("raw должен быть объектом")
-    entity = str(raw.get("user") or raw.get("host") or raw.get("peer") or raw.get("src_ip") or source_id)[:100]
-    correlation_key = str(payload.get("correlation_key") or f"{rule}:{entity}:{event_at.strftime('%Y%m%d%H')}")[:256]
-    inv = db.scalar(select(Investigation).where(Investigation.tenant_id == tenant_id, Investigation.correlation_key == correlation_key).with_for_update())
-    if not inv:
-        inv = Investigation(tenant_id=tenant_id, correlation_key=correlation_key, playbook_key=playbook.key,
-                            playbook_version=playbook.version, due_at=utcnow() + timedelta(minutes=15))
-        db.add(inv)
-        db.flush()
-    alert = Alert(tenant_id=tenant_id, investigation_id=inv.id, source=source, source_event_id=source_id,
-                  rule=rule, title=str(payload.get("title") or rule)[:300], severity=str(payload.get("severity") or "medium")[:20],
-                  event_at=event_at, original_timezone=str(payload.get("original_timezone") or source_time.tzinfo)[:80], raw=raw)
-    db.add(alert)
-    db.flush()
-    record_initial(db, alert)
-    for idx, event in enumerate((payload.get("events") or [])[:100]):
-        if isinstance(event, dict):
-            dt = event.get("event_at")
-            if dt:
-                source_event_time = datetime.fromisoformat(str(dt).replace("Z", "+00:00"))
-                if source_event_time.tzinfo is None or source_event_time.utcoffset() is None:
-                    raise ValueError("Вложенное event_at должно содержать часовое смещение")
-                when = source_event_time.astimezone(timezone.utc)
-            else:
-                when = event_at
-            db.add(EmbeddedEvent(tenant_id=tenant_id, alert_id=alert.id,
-                                 source_event_id=str(event.get("source_event_id") or f"{source_id}:{idx}")[:256],
-                                 event_at=when, original_timezone=str(event.get("original_timezone") or alert.original_timezone)[:80], data=event))
-    audit(db, tenant_id, "ingest", "alert_received", "alert", alert.id,
-          {"source": source, "source_event_id": source_id, "investigation_id": inv.id})
+    raw_time = payload["event_at"]
+    if isinstance(raw_time, datetime):
+        source_zone = raw_time.tzinfo
+    elif isinstance(raw_time, str):
+        try:
+            source_zone = datetime.fromisoformat(raw_time.replace("Z", "+00:00")).tzinfo
+        except ValueError:
+            source_zone = timezone.utc
+    else:
+        source_zone = timezone.utc
+    original_timezone = str(payload.get("original_timezone") or source_zone or "UTC")[:80]
+
+    def compatible_link(item: Alert) -> bool:
+        if not isinstance(item.normalized, dict):
+            return False
+        try:
+            prior = SecurityAlert.model_validate(item.normalized)
+        except ValueError:
+            return False
+        return compatible_for_correlation(
+            prior, normalized.alert, max_delta_seconds=config.correlation_window_seconds)
+
     try:
+        correlation_key = normalized.correlation_key
+        suffix = 0
+        while True:
+            inv = db.scalar(select(Investigation).where(
+                Investigation.tenant_id == tenant_id,
+                Investigation.correlation_key == correlation_key).with_for_update())
+            if not inv:
+                inv = Investigation(tenant_id=tenant_id, correlation_key=correlation_key,
+                                    playbook_key=playbook.key, playbook_version=playbook.version,
+                                    due_at=utcnow() + timedelta(minutes=15))
+                db.add(inv)
+                db.flush()
+                break
+            linked = db.scalars(select(Alert).where(Alert.tenant_id == tenant_id,
+                                                   Alert.investigation_id == inv.id)).all()
+            if linked and all(compatible_link(item) for item in linked):
+                break
+            # A supplied correlation key never authorizes an otherwise unsafe merge.
+            suffix += 1
+            correlation_key = sha256(
+                f"{normalized.correlation_key}:{normalized.fingerprint}:{source_id}:{suffix}".encode()
+            ).hexdigest()
+
+        alert = Alert(
+            tenant_id=tenant_id, investigation_id=inv.id, source=source,
+            source_event_id=source_id, rule=rule,
+            title=str(payload.get("title") or normalized.alert.rule_name or rule or source_id)[:300],
+            severity=(normalized.alert.severity or "unknown")[:20],
+            event_at=normalized.alert.event_time, original_timezone=original_timezone,
+            raw=normalized.original_raw, normalized=normalized.alert.model_dump(mode="json"),
+            fingerprint=normalized.fingerprint,
+        )
+        db.add(alert)
+        db.flush()
+        if claim:
+            claim.alert_id = alert.id
+            claim.expires_at = normalized.fingerprint_expires_at
+            claim.created_at = normalized.alert.ingestion_time
+        else:
+            db.add(AlertFingerprint(
+                tenant_id=tenant_id, fingerprint=normalized.fingerprint,
+                alert_id=alert.id, expires_at=normalized.fingerprint_expires_at,
+                created_at=normalized.alert.ingestion_time))
+        record_initial(db, alert)
+        for idx, event in enumerate((payload.get("events") or [])[:100]):
+            if isinstance(event, dict):
+                dt = event.get("event_at")
+                if dt:
+                    source_event_time = datetime.fromisoformat(str(dt).replace("Z", "+00:00"))
+                    if source_event_time.tzinfo is None or source_event_time.utcoffset() is None:
+                        raise ValueError("Вложенное event_at должно содержать часовое смещение")
+                    when = source_event_time.astimezone(timezone.utc)
+                else:
+                    when = normalized.alert.event_time
+                db.add(EmbeddedEvent(
+                    tenant_id=tenant_id, alert_id=alert.id,
+                    source_event_id=str(event.get("source_event_id") or f"{source_id}:{idx}")[:256],
+                    event_at=when,
+                    original_timezone=str(event.get("original_timezone") or alert.original_timezone)[:80],
+                    data=event))
+        audit(db, tenant_id, "ingest", "alert_received", "alert", alert.id,
+              {"source": source, "source_event_id": source_id,
+               "investigation_id": inv.id, "fingerprint": normalized.fingerprint})
         db.commit()
+        return alert, True
     except IntegrityError:
         db.rollback()
         existing = db.scalar(select(Alert).where(Alert.tenant_id == tenant_id, Alert.source == source, Alert.source_event_id == source_id))
         if existing:
-            audit(db, tenant_id, "ingest", "alert_deduplicated", "alert", existing.id,
-                  {"source": source, "source_event_id": source_id})
-            db.commit()
-            return existing, False
+            return duplicate(existing, "source_event_id")
+        _, original = active_fingerprint()
+        if original:
+            return duplicate(original, "fingerprint")
         if _attempt == 0:
             return ingest(db, tenant_id, payload, _attempt=1)
         raise
-    return alert, True
+    except Exception:
+        db.rollback()
+        raise
 
 
 def _ev(db: Session, inv: Investigation, kind: str, source: str, summary: str, data: dict,
@@ -164,7 +240,11 @@ def collect(db: Session, alert: Alert, inv: Investigation) -> tuple[list[Evidenc
         if raw.get("scenario_signal") == "splunk_unavailable" and settings().mode.upper() == "DEMO":
             raise AdapterError("Симулированная недоступность Splunk")
         if entities:
-            related = splunk.related_events(entities[0], alert.event_at - timedelta(hours=1), alert.event_at + timedelta(hours=1))
+            earliest = alert.event_at - timedelta(hours=1)
+            latest = alert.event_at + timedelta(hours=1)
+            rule_search = getattr(splunk, "related_events_for_rule", None)
+            related = (rule_search(alert.rule, entities[0], earliest, latest) if callable(rule_search)
+                       else splunk.related_events(entities[0], earliest, latest))
             for idx, event in enumerate(related[:20]):
                 _ev(db, inv, "related_event", "splunk", f"Связанное событие Splunk {idx + 1}", event)
         _integration(db, inv.tenant_id, "splunk", "healthy", received=True)
@@ -206,11 +286,14 @@ def can_act(tenant: Tenant, kind: str) -> bool:
         return False
     if level not in {"controlled_automation", "auto_close", "approved_response"}:
         return False
+    if kind == "suppress_noise" and level not in {"controlled_automation", "approved_response"}:
+        return False
     if kind in {"update_case", "disable_account_demo", "isolate_host_demo"} and level not in {
             "controlled_automation", "approved_response"}:
         return False
     if mode == "DEMO":
-        return kind in {"close_alert", "create_case", "update_case", "disable_account_demo", "isolate_host_demo"}
+        return kind in {"close_alert", "create_case", "update_case", "suppress_noise",
+                        "disable_account_demo", "isolate_host_demo"}
     return settings().connected_writes_enabled and kind in set(settings().connected_allowed_actions.split(","))
 
 
@@ -318,6 +401,90 @@ def manual_close_gate(db: Session, tenant: Tenant, inv: Investigation, evidence:
             "alert_ids": [a.id for a in linked]}
 
 
+def noise_suppression_gate(db: Session, tenant: Tenant, inv: Investigation, alert: Alert,
+                           evidence: list[Evidence], baseline: Verdict) -> tuple[dict | None, str]:
+    """Authorize a local grouping record; never close Splunk or a TheHive case."""
+    if not can_act(tenant, "suppress_noise"):
+        return None, "automation_level"
+    if (alert.rule != "ipsec_failure" or inv.playbook_key != alert.rule
+            or baseline.classification != "NOISE" or inv.classification != "NOISE"
+            or baseline.missing_data or inv.missing_data):
+        return None, "deterministic_rule"
+    if str(alert.severity).lower() not in {"low", "medium"} or inv.priority != "low":
+        return None, "critical_or_unknown_severity"
+    required = ("peer", "device", "tunnel", "failure_reason")
+    raw = alert.raw if isinstance(alert.raw, dict) else {}
+    if any(not isinstance(raw.get(key), str) or not raw[key] for key in required):
+        return None, "missing_scope"
+    linked = db.scalars(select(Alert).where(Alert.tenant_id == tenant.id,
+        Alert.investigation_id == inv.id).with_for_update()).all()
+    if (not linked or any(item.rule != alert.rule or str(item.severity).lower() not in {"low", "medium"}
+                          or not isinstance(item.raw, dict)
+                          or any(item.raw.get(key) != raw[key] for key in required)
+                          or item.status == "escalated" or item.pipeline_state == PipelineState.CASE_CREATED
+                          for item in linked)):
+        return None, "linked_alert_conflict"
+    if db.scalar(select(Case.id).where(Case.tenant_id == tenant.id,
+        Case.investigation_id == inv.id).limit(1)) or db.scalar(select(Action.id).where(
+            Action.tenant_id == tenant.id, Action.investigation_id == inv.id,
+            Action.kind == "create_case").limit(1)):
+        return None, "case_exists"
+    if settings().mode.upper() == "CONNECTED":
+        try:
+            if thehive_adapter().find_case(f"{inv.id}:create_case:case"):
+                return None, "external_case_exists"
+        except Exception:
+            return None, "thehive_unavailable"
+    evidence_by_id = {item.id: item for item in evidence
+                      if item.tenant_id == tenant.id and item.investigation_id == inv.id}
+    if not evidence_by_id or any(item.kind == "integration_error" for item in evidence_by_id.values()):
+        return None, "insufficient_evidence"
+    support_ids = {claim.evidence_id for claim in baseline.evidence_for}
+    support_kinds = {evidence_by_id[item_id].kind for item_id in support_ids if item_id in evidence_by_id}
+    if (not support_ids or not support_ids.issubset(evidence_by_id)
+            or not set(baseline.evidence_ids).issubset(evidence_by_id)
+            or not {"raw_alert", "asset"}.issubset({item.kind for item in evidence_by_id.values()})
+            or not ({"embedded_event", "related_event"} & support_kinds)
+            or "asset" not in support_kinds
+            or not ({"approved_maintenance", "active_exception"} & support_kinds)):
+        return None, "insufficient_evidence"
+    decision = db.scalar(select(Decision).where(Decision.tenant_id == tenant.id,
+        Decision.investigation_id == inv.id).order_by(Decision.created_at.desc(), Decision.id.desc()).limit(1))
+    if (not decision or decision.classification != "NOISE" or decision.verdict != "needs_review"
+            or decision.missing_data or not decision.evidence_ids
+            or not set(decision.evidence_ids).issubset(evidence_by_id)
+            or not db.scalar(select(Audit.id).where(Audit.tenant_id == tenant.id,
+                Audit.operation == "decision", Audit.subject_type == "investigation",
+                Audit.subject_id == inv.id).limit(1))):
+        return None, "decision_unverified"
+    peer = db.scalar(select(Asset).where(Asset.tenant_id == tenant.id, Asset.kind == "vpn_peer",
+        Asset.value == raw["peer"]).limit(1))
+    if (not peer or not isinstance(peer.attributes, dict) or peer.attributes.get("allowed") is not True
+            or peer.attributes.get("device") != raw["device"]
+            or peer.attributes.get("tunnel") != raw["tunnel"]):
+        return None, "peer_not_current"
+    now = utcnow()
+    windows = db.scalars(select(Maintenance).where(Maintenance.tenant_id == tenant.id,
+        Maintenance.entity == raw["peer"])).all()
+    if not any(aware(item.valid_from) <= aware(alert.event_at) < aware(item.valid_until)
+               and aware(item.valid_from) <= aware(now) < aware(item.valid_until)
+               and isinstance(item.scope, dict)
+               and all(item.scope.get(key) == raw[key] for key in ("peer", "device", "tunnel"))
+               for item in windows):
+        return None, "maintenance_not_current"
+    policies = db.scalars(select(SuppressionRule).where(SuppressionRule.tenant_id == tenant.id,
+        SuppressionRule.rule == alert.rule, SuppressionRule.entity == raw["peer"])).all()
+    policy = next((item for item in policies
+                   if suppression_is_effective(db, item, raw, alert.event_at, now)), None)
+    if not policy:
+        return None, "no_current_approved_policy"
+    group_input = json.dumps({"tenant": tenant.id, "rule": alert.rule,
+                              "scope": policy.scope}, sort_keys=True, separators=(",", ":"))
+    return {"policy_id": policy.id, "policy_version": policy.version,
+            "decision_id": decision.id, "evidence_ids": list(decision.evidence_ids),
+            "group_key": sha256(group_input.encode()).hexdigest()[:24]}, "approved"
+
+
 def update_case_status(db: Session, tenant: Tenant, case: Case, requested_status: str, actor: str) -> Action | None:
     """Persist an idempotent, policy-gated TheHive status change."""
     if not can_act(tenant, "update_case"):
@@ -329,7 +496,10 @@ def update_case_status(db: Session, tenant: Tenant, case: Case, requested_status
         completed = db.scalar(select(Action).where(Action.tenant_id == tenant.id,
             Action.idempotency_key == f"{case.id}:status:{revision}:{requested_status}",
             Action.status == "succeeded"))
-        if completed:
+        unresolved_before_return = db.scalar(select(Action.id).where(Action.tenant_id == tenant.id,
+            Action.kind.in_(["update_case", "update_case_fields"]), Action.target == case.id,
+            Action.status.in_(["pending", "unknown"])).limit(1))
+        if completed and not unresolved_before_return:
             return completed
     key = f"{case.id}:status:{revision + 1}:{requested_status}"
     action = db.scalar(select(Action).where(Action.tenant_id == tenant.id, Action.idempotency_key == key))
@@ -342,7 +512,7 @@ def update_case_status(db: Session, tenant: Tenant, case: Case, requested_status
         db.commit()
         return action
     unresolved = db.scalar(select(Action).where(Action.tenant_id == tenant.id,
-        Action.kind == "update_case", Action.target == case.id,
+        Action.kind.in_(["update_case", "update_case_fields"]), Action.target == case.id,
         Action.status.in_(["pending", "unknown"]), Action.id != (action.id if action else "")))
     if unresolved:
         raise ValueError("Сначала сверьте предыдущее действие с неопределённым результатом")
@@ -354,6 +524,14 @@ def update_case_status(db: Session, tenant: Tenant, case: Case, requested_status
     allowed = {item["value"] for item in hive.case_statuses() if not item.get("hidden")}
     if requested_status not in allowed:
         raise ValueError("Статус недоступен в TheHive")
+    # The local case row may lag behind an analyst's change in TheHive. Refuse
+    # to overwrite that change until the case is reconciled explicitly.
+    expected_status = "Open" if case.status == "open" else case.status
+    if expected_status not in allowed:
+        raise ValueError("Кейс ещё не готов к изменению статуса")
+    actual_status = hive.case_status(case.external_id)
+    if actual_status != expected_status:
+        raise ValueError("Статус кейса в TheHive отличается от локального; требуется сверка")
     if not action:
         action = Action(tenant_id=tenant.id, investigation_id=case.investigation_id,
                         kind="update_case", idempotency_key=key, target=case.id,
@@ -366,7 +544,10 @@ def update_case_status(db: Session, tenant: Tenant, case: Case, requested_status
         action.detail = {"requested_status": requested_status, "revision": revision + 1}
     db.commit()
     try:
-        hive.update_status(case.external_id, requested_status)
+        if actual_status != requested_status:
+            hive.update_status(case.external_id, requested_status)
+        if hive.case_status(case.external_id) != requested_status:
+            raise AdapterAmbiguousError("TheHive не подтвердил новый статус кейса")
         action.status = "succeeded"
         action.external_id = case.external_id
         action.detail = {"requested_status": requested_status, "revision": revision + 1,
@@ -378,8 +559,7 @@ def update_case_status(db: Session, tenant: Tenant, case: Case, requested_status
         audit(db, tenant.id, actor, "case_status_updated", "case", case.id,
               {"status": requested_status, "action_id": action.id})
     except Exception as exc:
-        import httpx
-        action.status = "unknown" if isinstance(exc, (TimeoutError, ConnectionError, httpx.RequestError)) else "failed"
+        action.status = "unknown" if _case_write_uncertain(exc) else "failed"
         action.detail = {"requested_status": requested_status, "revision": revision + 1,
                          "error_type": type(exc).__name__}
         _integration(db, tenant.id, "thehive", "unavailable", type(exc).__name__)
@@ -419,6 +599,144 @@ def reconcile_case_status(db: Session, tenant: Tenant, action: Action, case: Cas
                      "status_revision": revision}
         audit(db, tenant.id, actor, "case_status_reconciled", "case", case.id,
               {"status": requested, "action_id": action.id})
+        db.commit()
+    return action
+
+
+def _field_digest(value: object) -> str:
+    return sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _record_case_fields(case: Case, changes: dict) -> None:
+    hashes = dict((case.data or {}).get("remote_field_hashes") or {})
+    hashes.update({field: _field_digest(value) for field, value in changes.items()})
+    case.data = {**(case.data or {}), "remote_field_hashes": hashes}
+    if "title" in changes:
+        case.title = changes["title"]
+
+
+def _check_case_field_drift(db: Session, tenant: Tenant, case: Case, actual: dict) -> None:
+    hashes = (case.data or {}).get("remote_field_hashes") or {}
+    if not isinstance(hashes, dict):
+        raise ValueError("Сохранённые поля кейса повреждены")
+    created = db.scalar(select(CaseWrite).where(CaseWrite.tenant_id == tenant.id,
+        CaseWrite.case_id == case.id, CaseWrite.kind == "create_case").limit(1))
+    initial = created.request_data if created and isinstance(created.request_data, dict) else {}
+    for field, value in actual.items():
+        expected = hashes.get(field) or (_field_digest(initial[field]) if field in initial else None)
+        if expected and _field_digest(value) != expected:
+            raise ValueError("Поле кейса в TheHive отличается от локального; требуется сверка")
+
+
+def update_case_fields(db: Session, tenant: Tenant, case: Case, changes: dict, actor: str) -> Action | None:
+    """Persist one allowlisted case update before issuing a remote PATCH."""
+    if not can_act(tenant, "update_case"):
+        return None
+    fields = validate_case_fields(changes)
+    if "title" in fields and len(fields["title"]) > 300:
+        raise ValueError("Заголовок кейса превышает локальный лимит 300 символов")
+    if (case.tenant_id != tenant.id or not case.external_id or not case.status
+            or case.status in {"pending", "pending_enrichment", "enrichment_unknown", "enrichment_failed"}):
+        raise ValueError("Кейс не готов к изменению полей")
+    revision = int((case.data or {}).get("fields_revision", 0))
+    digest = _field_digest(fields)[:24]
+    key = f"{case.id}:fields:{revision + 1}:{digest}"
+    action = db.scalar(select(Action).where(Action.tenant_id == tenant.id,
+        Action.idempotency_key == key))
+    unresolved = db.scalar(select(Action).where(Action.tenant_id == tenant.id,
+        Action.kind.in_(["update_case", "update_case_fields"]), Action.target == case.id,
+        Action.status.in_(["pending", "unknown"]), Action.id != (action.id if action else "")))
+    if unresolved:
+        raise ValueError("Сначала сверьте предыдущее действие с неопределённым результатом")
+    if action and action.status == "unknown":
+        return action
+    if action and action.status == "pending":
+        if action.attempted_at and utcnow() - aware(action.attempted_at) < timedelta(minutes=2):
+            return action
+        action.status = "unknown"
+        db.commit()
+        return action
+    if revision:
+        completed = db.scalar(select(Action).where(Action.tenant_id == tenant.id,
+            Action.idempotency_key == f"{case.id}:fields:{revision}:{digest}",
+            Action.status == "succeeded"))
+        if completed:
+            return completed
+    hive = thehive_adapter()
+    creation = db.scalar(select(Action).where(Action.tenant_id == tenant.id,
+        Action.investigation_id == case.investigation_id, Action.kind == "create_case").limit(1))
+    if not creation or hive.find_case(creation.idempotency_key) != case.external_id:
+        raise ValueError("Связь кейса с расследованием не подтверждена в TheHive")
+    expected_status = "Open" if case.status == "open" else case.status
+    if hive.case_status(case.external_id) != expected_status:
+        raise ValueError("Статус кейса в TheHive отличается от локального; требуется сверка")
+    current = hive.case_fields(case.external_id, list(fields))
+    _check_case_field_drift(db, tenant, case, current)
+    if not action:
+        action = Action(tenant_id=tenant.id, investigation_id=case.investigation_id,
+                        kind="update_case_fields", idempotency_key=key, target=case.id)
+        db.add(action)
+        db.flush()
+    action.status = "pending"
+    action.detail = {"requested_fields": fields, "revision": revision + 1,
+                     "field_digest": digest}
+    action.attempted_at = utcnow()
+    audit(db, tenant.id, actor, "case_fields_update_attempted", "case", case.id,
+          {"action_id": action.id, "fields": sorted(fields)})
+    db.commit()
+    try:
+        hive.update_case_fields(case.external_id, fields)
+        if hive.case_fields(case.external_id, list(fields)) != fields:
+            raise AdapterAmbiguousError("TheHive не подтвердил изменение полей кейса")
+        action.status = "succeeded"
+        action.external_id = case.external_id
+        action.completed_at = utcnow()
+        action.detail = {**action.detail, "stage": "completed"}
+        _record_case_fields(case, fields)
+        case.data = {**(case.data or {}), "fields_revision": revision + 1}
+        audit(db, tenant.id, actor, "case_fields_updated", "case", case.id,
+              {"action_id": action.id, "fields": sorted(fields)})
+    except Exception as exc:
+        action.status = "unknown" if _case_write_uncertain(exc) else "failed"
+        action.detail = {**action.detail, "error_type": type(exc).__name__}
+        _integration(db, tenant.id, "thehive", "unavailable", type(exc).__name__)
+        audit(db, tenant.id, actor, "case_fields_update_unconfirmed", "case", case.id,
+              {"action_id": action.id, "outcome": action.status})
+    db.commit()
+    return action
+
+
+def reconcile_case_fields(db: Session, tenant: Tenant, action: Action, case: Case, actor: str) -> Action:
+    """Resolve an uncertain field update by readback, without replaying PATCH."""
+    if action.status != "unknown" or action.kind != "update_case_fields":
+        return action
+    if action.tenant_id != tenant.id or action.target != case.id or case.tenant_id != tenant.id or not case.external_id:
+        raise ValueError("Действие не принадлежит этому кейсу")
+    fields = (action.detail or {}).get("requested_fields")
+    try:
+        fields = validate_case_fields(fields)
+        hive = thehive_adapter()
+        creation = db.scalar(select(Action).where(Action.tenant_id == tenant.id,
+            Action.investigation_id == case.investigation_id, Action.kind == "create_case").limit(1))
+        if not creation or hive.find_case(creation.idempotency_key) != case.external_id:
+            raise AdapterError("Связь кейса с расследованием не подтверждена в TheHive")
+        actual = hive.case_fields(case.external_id, list(fields))
+    except Exception as exc:
+        _integration(db, tenant.id, "thehive", "unavailable", type(exc).__name__)
+        db.commit()
+        return action
+    if actual == fields:
+        revision = max(int((case.data or {}).get("fields_revision", 0)),
+                       int((action.detail or {}).get("revision", 0)))
+        action.status = "succeeded"
+        action.external_id = case.external_id
+        action.completed_at = utcnow()
+        action.detail = {**(action.detail or {}), "stage": "completed"}
+        _record_case_fields(case, fields)
+        case.data = {**(case.data or {}), "fields_revision": revision}
+        audit(db, tenant.id, actor, "case_fields_reconciled", "case", case.id,
+              {"action_id": action.id, "fields": sorted(fields)})
         db.commit()
     return action
 
@@ -843,10 +1161,29 @@ def process_alert(db: Session, alert_id: str) -> None:
     elif decision.classification == "TP":
         action = perform_action(db, tenant, inv, alert, "create_case", evidence)
         status = "escalated" if action and action.status == "succeeded" else "needs_review"
+    elif decision.classification == "NOISE":
+        grant, reason = noise_suppression_gate(db, tenant, inv, alert, evidence, baseline)
+        if grant:
+            now = utcnow()
+            action = Action(tenant_id=tenant.id, investigation_id=inv.id, kind="suppress_noise",
+                            status="succeeded", idempotency_key=f"{inv.id}:suppress_noise:{alert.id}",
+                            target=alert.source_event_id, detail=grant,
+                            attempted_at=now, completed_at=now)
+            db.add(action)
+            db.flush()
+            audit(db, tenant.id, "policy", "noise_suppressed", "action", action.id,
+                  {"alert_id": alert.id, "policy_id": grant["policy_id"],
+                   "policy_version": grant["policy_version"], "group_key": grant["group_key"]})
+            status = "suppressed"
+        else:
+            audit(db, tenant.id, "policy", "noise_suppression_denied", "investigation", inv.id,
+                  {"alert_id": alert.id, "reason": reason})
+            status = "needs_review"
     else:
         status = "needs_review"
     target_state = {"auto_closed": PipelineState.CLOSED_FP,
-                    "escalated": PipelineState.CASE_CREATED}.get(status, PipelineState.NEEDS_REVIEW)
+                    "escalated": PipelineState.CASE_CREATED,
+                    "suppressed": PipelineState.SUPPRESSED}.get(status, PipelineState.NEEDS_REVIEW)
     if target_state == PipelineState.CASE_CREATED and alert.pipeline_state == PipelineState.TRIAGED:
         move_alert(db, alert, PipelineState.CASE_PENDING, "worker", "case_already_confirmed")
     if target_state == PipelineState.CLOSED_FP and alert.pipeline_state == PipelineState.TRIAGED:

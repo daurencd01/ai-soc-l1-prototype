@@ -1,11 +1,17 @@
 from datetime import timedelta
+from hashlib import sha256
+import json
 from celery import Celery
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from .adapters import splunk_adapter, thehive_adapter, misp_adapter
 from .config import settings
 from .db import SessionLocal
-from .models import (Alert, Checkpoint, DeadLetter, IntegrationState, Investigation, MispNotice, PlaybookRun, Tenant, utcnow)
-from .security import audit
+from .ingestion import normalize_alert
+from .models import (Alert, Checkpoint, DeadLetter, IngestionQuarantine, IntegrationState,
+                     Investigation, MispNotice, PlaybookRun, Tenant, utcnow)
+from .observability import log_event
+from .security import audit, validate_runtime_secrets
 from .state import PipelineState, move_alert
 from .workflow import _integration, aware, ingest, process_alert
 
@@ -18,6 +24,7 @@ celery_app.conf.update(task_serializer="json", accept_content=["json"], result_s
                            "poll_splunk": {"task": "soc.poll_splunk", "schedule": float(settings().splunk_poll_seconds)},
                            "health": {"task": "soc.check_integrations", "schedule": 120.0},
                        })
+validate_runtime_secrets(settings().mode, settings().jwt_secret, settings().webhook_secret)
 
 
 def dispatch(alert_id: str) -> bool:
@@ -41,9 +48,11 @@ def process_alert_task(self, alert_id: str) -> None:
     with SessionLocal() as db:
         try:
             process_alert(db, alert_id)
+            log_event("alert_processed", event_id=alert_id)
         except Exception as exc:
             db.rollback()
             if self.request.retries < self.max_retries:
+                log_event("alert_retryable_error", event_id=alert_id, error_type=type(exc).__name__)
                 alert = db.get(Alert, alert_id)
                 if alert:
                     if alert.pipeline_state not in {PipelineState.CASE_CREATED, PipelineState.CLOSED_FP,
@@ -81,6 +90,8 @@ def process_alert_task(self, alert_id: str) -> None:
                 audit(db, alert.tenant_id, "worker", "dead_letter", "alert", alert.id,
                       {"error_type": type(exc).__name__})
                 db.commit()
+                log_event("alert_dead_lettered", event_id=alert_id,
+                          tenant_id=alert.tenant_id, error_type=type(exc).__name__)
 
 
 @celery_app.task(name="soc.recover")
@@ -121,6 +132,63 @@ def recover() -> int:
         return count
 
 
+MAX_QUARANTINE_RAW_BYTES = 256 * 1024
+
+
+def _splunk_row_identity(row: object) -> tuple[dict | object, str, str]:
+    """Keep the original JSON, but ignore volatile search metadata for identity."""
+    raw_json = json.dumps(row, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False, allow_nan=False)
+    stable_row = ({key: value for key, value in row.items()
+                   if not key.startswith("_soc_splunk_")} if isinstance(row, dict) else row)
+    stable_json = json.dumps(stable_row, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False, allow_nan=False)
+    supplied = (stable_row.get("_cd") or stable_row.get("event_id")) if isinstance(stable_row, dict) else None
+    if isinstance(supplied, (str, int)) and not isinstance(supplied, bool):
+        source_id = str(supplied)
+    else:
+        source_id = ""
+    if not source_id:
+        source_id = sha256(stable_json.encode()).hexdigest()
+    elif len(source_id) > 256 or any(ord(char) < 32 or ord(char) == 127 for char in source_id):
+        source_id = "sha256:" + sha256(source_id.encode()).hexdigest()
+    return stable_row, raw_json, source_id
+
+
+def _save_quarantine(db, tenant_id: str, source_id: str, raw_json: str, exc: Exception) -> None:
+    """Commit before continuing; a failed write must leave the checkpoint in place."""
+    full_raw = raw_json.encode("utf-8")
+    truncated = len(full_raw) > MAX_QUARANTINE_RAW_BYTES
+    excerpt = (full_raw[:MAX_QUARANTINE_RAW_BYTES].decode("utf-8", errors="ignore")
+               if truncated else raw_json)
+    row = db.scalar(select(IngestionQuarantine).where(
+        IngestionQuarantine.tenant_id == tenant_id,
+        IngestionQuarantine.source == "splunk",
+        IngestionQuarantine.source_event_id == source_id).with_for_update())
+    if row:
+        row.occurrences += 1
+        row.last_seen_at = utcnow()
+    else:
+        db.add(IngestionQuarantine(
+            tenant_id=tenant_id, source="splunk", source_event_id=source_id,
+            raw_json=excerpt, raw_sha256=sha256(full_raw).hexdigest(),
+            raw_bytes=len(full_raw), raw_truncated=truncated,
+            error_type=type(exc).__name__[:100], reason=str(exc)[:500]))
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        row = db.scalar(select(IngestionQuarantine).where(
+            IngestionQuarantine.tenant_id == tenant_id,
+            IngestionQuarantine.source == "splunk",
+            IngestionQuarantine.source_event_id == source_id).with_for_update())
+        if row is None:
+            raise
+        row.occurrences += 1
+        row.last_seen_at = utcnow()
+        db.commit()
+
+
 @celery_app.task(name="soc.poll_splunk")
 def poll_splunk() -> int:
     if settings().mode.upper() != "CONNECTED":
@@ -136,19 +204,41 @@ def poll_splunk() -> int:
         for tenant in tenants:
             now = utcnow()
             cp = db.scalar(select(Checkpoint).where(Checkpoint.tenant_id == tenant.id, Checkpoint.source == "splunk"))
-            earliest = (cp.cursor_at if cp else now - timedelta(minutes=5)) - timedelta(seconds=settings().splunk_overlap_seconds)
+            cursor = aware(cp.cursor_at) if cp else now - timedelta(minutes=5)
+            if cursor >= now:
+                _integration(db, tenant.id, "splunk", "degraded", "Checkpoint Splunk находится в будущем")
+                db.commit()
+                return total
+            max_window = settings().splunk_max_window_seconds
+            overlap = max(0, min(settings().splunk_overlap_seconds, max_window // 2))
+            earliest = cursor - timedelta(seconds=overlap)
+            latest = min(now, cursor + timedelta(seconds=max_window - overlap))
             try:
                 splunk = splunk_adapter()
-                rows = splunk.poll(earliest, now)
+                rows = splunk.poll(earliest, latest)
+                quarantined = 0
                 for row in rows:
-                    source_id = str(row.get("_cd") or row.get("event_id") or row.get("sid") or "")
-                    if not source_id:
+                    stable_row, raw_json, source_id = _splunk_row_identity(row)
+                    try:
+                        if not isinstance(stable_row, dict):
+                            raise ValueError("Строка Splunk должна быть объектом")
+                        payload = {"source": "splunk", "source_event_id": source_id,
+                                   "event_at": (stable_row.get("_time") if "_time" in stable_row
+                                                else stable_row.get("event_at")),
+                                   "raw": stable_row}
+                        if "rule" not in stable_row and stable_row.get("search_name"):
+                            payload["rule"] = stable_row["search_name"]
+                        if stable_row.get("title") or stable_row.get("search_name"):
+                            payload["title"] = stable_row.get("title") or stable_row["search_name"]
+                        if stable_row.get("original_timezone"):
+                            payload["original_timezone"] = stable_row["original_timezone"]
+                        normalize_alert(payload, tenant.id)
+                    except (TypeError, ValueError) as exc:
+                        _save_quarantine(db, tenant.id, source_id, raw_json, exc)
+                        quarantined += 1
+                        log_event("splunk_row_quarantined", tenant_id=tenant.id,
+                                  error_type=type(exc).__name__)
                         continue
-                    payload = {"source": "splunk", "source_event_id": source_id,
-                               "rule": row.get("rule") or row.get("search_name") or "generic",
-                               "title": row.get("title") or row.get("search_name") or "Событие Splunk",
-                               "severity": row.get("severity") or "medium", "event_at": row.get("_time") or now.isoformat(),
-                               "original_timezone": row.get("original_timezone") or "UTC", "raw": row}
                     alert, created = ingest(db, tenant.id, payload)
                     if created:
                         dispatch(alert.id)
@@ -156,17 +246,23 @@ def poll_splunk() -> int:
                 if len(rows) >= 2000:
                     _integration(db, tenant.id, "splunk", "degraded", "Окно опроса достигло лимита 2000; checkpoint не сдвинут")
                     db.commit()
+                    log_event("splunk_poll_capped", tenant_id=tenant.id, status="degraded")
                     return total
                 if not cp:
-                    cp = Checkpoint(tenant_id=tenant.id, source="splunk", cursor_at=now)
+                    cp = Checkpoint(tenant_id=tenant.id, source="splunk", cursor_at=latest)
                     db.add(cp)
-                cp.cursor_at, cp.updated_at = now, now
-                _integration(db, tenant.id, "splunk", "healthy", received=bool(rows))
+                cp.cursor_at, cp.updated_at = latest, now
+                status = "degraded" if quarantined else "healthy"
+                detail = f"Некорректных строк сохранено в карантин: {quarantined}" if quarantined else ""
+                _integration(db, tenant.id, "splunk", status, detail, received=bool(rows))
                 db.commit()
+                log_event("splunk_poll_completed", tenant_id=tenant.id, status=status)
             except Exception as exc:
                 db.rollback()
                 _integration(db, tenant.id, "splunk", "unavailable", type(exc).__name__)
                 db.commit()
+                log_event("splunk_poll_failed", tenant_id=tenant.id, status="unavailable",
+                          error_type=type(exc).__name__)
     return total
 
 

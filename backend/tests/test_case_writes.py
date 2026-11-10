@@ -96,8 +96,8 @@ def test_step_timeout_after_write_reconciles_without_duplicate(monkeypatch):
     engine, tenant_id, alert_id, inv_id = setup(monkeypatch, hive)
     action, case, writes = rows(engine, tenant_id)
     assert action.status == "unknown" and case.status == "enrichment_unknown"
-    assert [row.kind for row in writes] == ["create_case", "evidence_page", "observable", "task"]
-    assert [row.status for row in writes] == ["succeeded", "unknown", "pending", "pending"]
+    assert [row.kind for row in writes] == ["create_case", "evidence_page", "comment", "observable", "task"]
+    assert [row.status for row in writes] == ["succeeded", "unknown", "pending", "pending", "pending"]
     assert all(row.idempotency_key and row.request_data for row in writes)
     assert all(row.attempts == 1 for row in writes[:2]) and writes[2].attempts == 0
     with Session(engine) as db:
@@ -108,6 +108,7 @@ def test_step_timeout_after_write_reconciles_without_duplicate(monkeypatch):
     assert case.status == "open" and all(row.status == "succeeded" for row in writes)
     assert hive.create_calls == 1
     assert hive.write_calls.count("evidence_page") == 1
+    assert hive.write_calls.count("comment") == 1
     assert hive.write_calls.count("observable") == 1
     assert hive.write_calls.count("task") == 1
     assert hive.read_calls == ["evidence_page"]
@@ -126,12 +127,25 @@ def test_negative_step_readback_keeps_unknown_and_never_rewrites(monkeypatch):
     assert hive.read_calls == ["evidence_page"]
 
 
+def test_comment_timeout_reconciles_without_second_comment(monkeypatch):
+    hive = HiveDouble("comment", "timeout_after_write")
+    engine, tenant_id, alert_id, inv_id = setup(monkeypatch, hive)
+    action, _, writes = rows(engine, tenant_id)
+    assert action.status == "unknown"
+    assert [item.kind for item in writes] == ["create_case", "evidence_page", "comment", "observable", "task"]
+    assert writes[2].status == "unknown"
+    assert writes[2].request_data["external"] is False
+    assert reconcile(engine, tenant_id, alert_id, inv_id) == "succeeded"
+    assert hive.write_calls.count("comment") == 1
+    assert hive.read_calls == ["comment"]
+
+
 def test_definite_step_rejection_never_marks_overall_case_succeeded(monkeypatch):
     hive = HiveDouble("task", "rejected")
     engine, tenant_id, alert_id, inv_id = setup(monkeypatch, hive)
     action, case, writes = rows(engine, tenant_id)
     assert action.status == "failed" and case.status == "enrichment_failed"
-    assert [row.status for row in writes] == ["succeeded", "succeeded", "succeeded", "failed"]
+    assert [row.status for row in writes] == ["succeeded", "succeeded", "succeeded", "succeeded", "failed"]
     assert reconcile(engine, tenant_id, alert_id, inv_id) == "failed"
     assert hive.write_calls.count("task") == 1
 
@@ -165,9 +179,9 @@ def test_observable_write_has_own_key_and_reconciles(monkeypatch):
     hive = HiveDouble("observable", "timeout_after_write")
     engine, tenant_id, alert_id, inv_id = setup(monkeypatch, hive, observable=True)
     action, case, writes = rows(engine, tenant_id)
-    assert [item.kind for item in writes] == ["create_case", "evidence_page", "observable", "task"]
-    assert [item.status for item in writes] == ["succeeded", "succeeded", "unknown", "pending"]
-    assert writes[2].request_data["data"] == "203.0.113.41"
+    assert [item.kind for item in writes] == ["create_case", "evidence_page", "comment", "observable", "task"]
+    assert [item.status for item in writes] == ["succeeded", "succeeded", "succeeded", "unknown", "pending"]
+    assert writes[3].request_data["data"] == "203.0.113.41"
     assert len({item.idempotency_key for item in writes}) == len(writes)
     assert reconcile(engine, tenant_id, alert_id, inv_id) == "succeeded"
     assert hive.write_calls.count("observable") == 1

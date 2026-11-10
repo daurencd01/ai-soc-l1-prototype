@@ -1,7 +1,7 @@
 """Bounded external clients. All returned data is evidence, never instructions."""
 from abc import ABC, abstractmethod
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 from hashlib import sha256
 from threading import RLock
 from urllib.parse import quote
@@ -35,6 +35,11 @@ class SplunkAdapter(ABC):
 
 class DemoSplunk(SplunkAdapter):
     def related_events(self, entity: str, earliest: datetime, latest: datetime) -> list[dict]:
+        if entity == "demo-parser-error-01":
+            return [{"kind": "ssh_login_failure", "event_id": "demo-auth-parser-01",
+                     "result": "denied", "user": "root", "host": entity,
+                     "src_ip": "10.10.1.44", "auth_method": "publickey",
+                     "_time": (earliest + timedelta(hours=1)).isoformat()}]
         return []
 
     def poll(self, earliest: datetime, latest: datetime) -> list[dict]:
@@ -138,7 +143,9 @@ class RealSplunk(SplunkAdapter):
 
 class TheHiveAdapter(ABC):
     @abstractmethod
-    def create_case(self, title: str, description: str, key: str) -> str: ...
+    def create_case(self, title: str, description: str, key: str, *, severity: int = 2,
+                    tags: list[str] | None = None, start_date: int | None = None,
+                    end_date: int | None = None) -> str: ...
 
     @abstractmethod
     def add_evidence(self, case_id: str, evidence: list[dict]) -> None: ...
@@ -174,10 +181,14 @@ class DemoTheHive(TheHiveAdapter):
     _cases: dict[str, dict] = {}
     _lock = RLock()
 
-    def create_case(self, title: str, description: str, key: str) -> str:
+    def create_case(self, title: str, description: str, key: str, *, severity: int = 2,
+                    tags: list[str] | None = None, start_date: int | None = None,
+                    end_date: int | None = None) -> str:
         case_id = f"demo-case:{key}"
         with self._lock:
             self._cases.setdefault(case_id, {"key": key, "title": title, "description": description,
+                                             "severity": severity, "tags": list(tags or []),
+                                             "start_date": start_date, "end_date": end_date,
                                              "status": "Open", "steps": {}})
         return case_id
 
@@ -324,13 +335,28 @@ class RealTheHive(TheHiveAdapter):
         self._verified_version = version
         return version
 
-    def create_case(self, title: str, description: str, key: str) -> str:
+    def create_case(self, title: str, description: str, key: str, *, severity: int = 2,
+                    tags: list[str] | None = None, start_date: int | None = None,
+                    end_date: int | None = None) -> str:
         self._verify_version()
+        if isinstance(severity, bool) or severity not in {1, 2, 3, 4}:
+            raise AdapterError("Недопустимая критичность кейса TheHive")
+        if tags is not None and (not isinstance(tags, list) or any(
+                not isinstance(tag, str) or not tag or len(tag) > 128 for tag in tags)):
+            raise AdapterError("Недопустимые теги кейса TheHive")
+        if any(value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0)
+               for value in (start_date, end_date)) or (start_date and end_date and end_date < start_date):
+            raise AdapterError("Недопустимый временной интервал кейса TheHive")
         found = self.find_case(key)
         if found:
             return found
-        result = self._request("POST", "/api/v1/case", {"title": title, "description": description,
-                         "severity": 2, "tags": [f"soc-key:{key}"], "flag": False})
+        body = {"title": title, "description": description, "severity": severity,
+                "tags": list(dict.fromkeys([f"soc-key:{key}", *(tags or [])])), "flag": False}
+        if start_date is not None:
+            body["startDate"] = start_date
+        if end_date is not None:
+            body["endDate"] = end_date
+        result = self._request("POST", "/api/v1/case", body)
         case_id = (result.get("_id") or result.get("id")) if isinstance(result, dict) else None
         if not isinstance(case_id, str) or not case_id:
             raise AdapterAmbiguousError("TheHive принял создание кейса, но не подтвердил ID; требуется сверка")

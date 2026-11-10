@@ -1,6 +1,8 @@
 services:
   db:
     image: postgres:17-alpine
+    restart: unless-stopped
+    networks: [back]
     environment:
       POSTGRES_DB: soc
       POSTGRES_USER: soc
@@ -13,6 +15,8 @@ services:
       retries: 15
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
+    networks: [back]
     command: ["redis-server", "--save", "60", "1"]
     volumes:
       - redis_data:/data
@@ -22,6 +26,8 @@ services:
       retries: 15
   backend:
     build: ./backend
+    restart: unless-stopped
+    networks: [front, back]
     environment: &backend_env
       MODE: ${MODE:-DEMO}
       DATABASE_URL: postgresql+psycopg://soc:${POSTGRES_PASSWORD:-soc-demo-only}@db:5432/soc
@@ -64,25 +70,33 @@ services:
       retries: 15
   worker:
     build: ./backend
+    restart: unless-stopped
+    networks: [back]
     command: ["celery", "-A", "app.tasks:celery_app", "worker", "--loglevel=INFO", "--concurrency=2"]
     environment: *backend_env
     depends_on:
       backend: {condition: service_healthy}
   beat:
     build: ./backend
+    restart: unless-stopped
+    networks: [back]
     command: ["celery", "-A", "app.tasks:celery_app", "beat", "--loglevel=INFO"]
     environment: *backend_env
     depends_on:
       backend: {condition: service_healthy}
   frontend:
     build: ./frontend
+    restart: unless-stopped
+    networks: [front]
     ports:
-      - "5173:80"
+      - "${FRONTEND_BIND_ADDRESS:-127.0.0.1}:5173:80"
     depends_on:
       backend: {condition: service_healthy}
   ollama:
     image: ollama/ollama:0.40.8
     profiles: [llm]
+    restart: unless-stopped
+    networks: [back]
     environment:
       OLLAMA_HOST: 0.0.0.0:11434
       OLLAMA_NO_CLOUD: "1"
@@ -92,3 +106,7 @@ volumes:
   postgres_data:
   redis_data:
   ollama_data:
+networks:
+  front:
+  back:
+    internal: true

@@ -16,15 +16,17 @@ DATA.mkdir(exist_ok=True)
 sys.path.insert(0, str(ROOT / "backend"))
 
 os.environ["MODE"] = "DEMO"
-os.environ["DATABASE_URL"] = f"sqlite:///{(DATA / 'soc.sqlite').as_posix()}"
+os.environ["DATABASE_URL"] = f"sqlite:///{(DATA / 'soc-v2.sqlite').as_posix()}"
 os.environ["JWT_SECRET"] = "local-demo-only-jwt-secret-32-characters-minimum"
 os.environ["WEBHOOK_SECRET"] = "local-demo-only-webhook-secret-32-characters-minimum"
 
-from app.db import Base, engine  # noqa: E402
+from alembic import command  # noqa: E402
+from alembic.config import Config  # noqa: E402
 from app.tasks import celery_app  # noqa: E402
-import app.models  # noqa: E402,F401
 
-Base.metadata.create_all(engine)
+alembic = Config(str(ROOT / "backend" / "alembic.ini"))
+alembic.set_main_option("script_location", str(ROOT / "backend" / "alembic"))
+command.upgrade(alembic, "head")
 celery_app.conf.update(task_always_eager=True, task_eager_propagates=True)
 
 from app.main import app  # noqa: E402

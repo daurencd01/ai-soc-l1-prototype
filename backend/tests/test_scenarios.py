@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 from app.db import Base, get_db
 import app.main as main_module
-from app.models import Alert, Investigation, Tenant, User
+from app.models import Action, Alert, Investigation, Tenant, User
 from app.scenarios import SCENARIOS
 from app.security import hash_password, token_for
 from app.workflow import process_alert
@@ -42,5 +42,10 @@ def test_demo_scenario_verdict_matches_catalogue(key, monkeypatch):
                 process_alert(db, alert.id)
             inv = db.get(Investigation, alerts[0].investigation_id)
             assert inv.verdict == SCENARIOS[key]["expected_verdict"], (key, inv.rationale)
+            assert inv.classification == SCENARIOS[key]["expected_classification"], (key, inv.rationale)
+            if inv.classification in {"BENIGN_TRUE_POSITIVE", "NOISE"}:
+                assert not db.scalars(select(Action).where(
+                    Action.tenant_id == owner_id, Action.investigation_id == inv.id,
+                    Action.kind == "close_alert")).all()
     finally:
         main_module.app.dependency_overrides.clear()

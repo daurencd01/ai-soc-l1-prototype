@@ -15,13 +15,18 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .config import settings
 from .db import SessionLocal, get_db
-from .models import (Action, Alert, Asset, Audit, Case, CaseWrite, DeadLetter, Decision, EmbeddedEvent, Evidence,
-                     ExceptionRule, IntegrationState, Investigation, Maintenance, MispNotice, PlaybookRun,
-                     Report, Shift, Tenant, User, utcnow)
+from .classification import Classification, action_lane, classification_for_lane
+from .metrics import metric_snapshot
+from .models import (Action, Alert, Asset, Audit, Case, CaseWrite, DeadLetter, Decision, Evidence,
+                     ExceptionRule, IntegrationState, Investigation, Maintenance, MispNotice, PlaybookRun, PolicyEvent,
+                     PipelineTransition, Report, Shift, Tenant, User, utcnow)
 from .playbooks import REGISTRY
+from .policy import aware as policy_aware, record_event, validate_contract
 from .report import build_report, export_docx_bytes, export_txt_bytes, next_report_version
-from .security import admin, audit, current_user, hash_password, token_for, verify_password
-from .tasks import check_integrations, dispatch
+from .security import (admin, analyst, audit, current_user, hash_password, policy_approver,
+                       policy_revoker, token_for, verify_password)
+from .state import PipelineState, move_alert
+from .tasks import celery_app, check_integrations, dispatch
 from .workflow import (ManualCloseDenied, aware, ingest, manual_close_gate,
                        perform_action, reconcile_case_status, update_case_status)
 
@@ -34,7 +39,7 @@ def seed() -> None:
                 raise RuntimeError("MODE не соответствует существующей БД: используйте отдельную базу для CONNECTED")
             return
         if settings().mode.upper() == "DEMO":
-            main = Tenant(name="Sauyt.Lab — DEMO", deployment_mode="DEMO", automation_level="auto_close")
+            main = Tenant(name="Sauyt.Lab — DEMO", deployment_mode="DEMO", automation_level="controlled_automation")
             second = Tenant(name="Отдельный заказчик — DEMO", deployment_mode="DEMO", automation_level="observe")
             db.add_all([main, second])
             db.flush()
@@ -76,17 +81,34 @@ class LoginIn(BaseModel):
 
 
 class ReviewIn(BaseModel):
-    verdict: Literal["true_positive", "false_positive", "needs_review"]
+    classification: Classification | None = None
+    verdict: Literal["true_positive", "false_positive", "needs_review"] | None = None
     note: str = Field(min_length=3, max_length=2000)
 
 
 class WindowIn(BaseModel):
-    rule: str = "*"
-    entity: str
-    reason: str
+    rule: str = Field(default="*", min_length=1, max_length=100)
+    entity: str = Field(min_length=1, max_length=256)
+    reason: str = Field(min_length=3, max_length=2000)
     scope: dict[str, str] = Field(default_factory=dict)
     valid_from: datetime
     valid_until: datetime
+    owner: str | None = Field(default=None, max_length=100)
+    change_reason: str = Field(default="Initial proposal", min_length=3, max_length=1000)
+
+
+class PolicyRevokeIn(BaseModel):
+    reason: str = Field(min_length=10, max_length=1000)
+
+
+class PolicyVersionIn(WindowIn):
+    change_reason: str = Field(min_length=10, max_length=1000)
+
+
+class UserIn(BaseModel):
+    username: str = Field(min_length=3, max_length=100, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,99}$")
+    password: str = Field(min_length=12, max_length=128)
+    role: Literal["viewer", "analyst", "policy_approver"]
 
 
 class MaintenanceIn(BaseModel):
@@ -107,7 +129,8 @@ class ShiftIn(BaseModel):
 
 
 class SettingsIn(BaseModel):
-    automation_level: Literal["observe", "auto_close", "approved_response"]
+    automation_level: Literal["disabled", "observe", "recommend", "controlled_automation",
+                              "auto_close", "approved_response"]
 
 
 class CaseStatusIn(BaseModel):
@@ -130,6 +153,14 @@ class MispNoticeUpdate(BaseModel):
 
 def serialize(row, keys: tuple[str, ...]) -> dict:
     return {key: getattr(row, key) for key in keys}
+
+
+def exception_view(row: ExceptionRule) -> dict:
+    return {**serialize(row, ("id", "policy_key", "version", "rule", "entity", "owner", "created_by",
+                              "reason", "scope", "valid_from", "valid_until", "approval_status",
+                              "approved_by", "approved_at", "revoked_by", "revoked_at",
+                              "change_reason", "revocation_reason", "created_at")),
+            "rule_id": row.rule}
 
 
 def integration_view(row: IntegrationState) -> dict:
@@ -165,8 +196,9 @@ def live():
 def ready(db: Session = Depends(get_db)):
     try:
         db.execute(text("SELECT 1"))
-        import redis
-        redis.Redis.from_url(settings().redis_url, socket_timeout=2).ping()
+        if not celery_app.conf.task_always_eager:
+            import redis
+            redis.Redis.from_url(settings().redis_url, socket_timeout=2).ping()
     except Exception:
         raise HTTPException(503, "БД или очередь недоступны")
     return {"status": "ready"}
@@ -189,8 +221,45 @@ def me(user: User = Depends(current_user), db: Session = Depends(get_db)):
             "tenant_name": tenant.name, "mode": settings().mode.upper()}
 
 
+@app.get("/api/users")
+def users(user: User = Depends(admin), db: Session = Depends(get_db)):
+    rows = db.scalars(select(User).where(User.tenant_id == user.tenant_id)
+                      .order_by(User.username).limit(200)).all()
+    return {"items": [serialize(x, ("id", "username", "role", "active")) for x in rows]}
+
+
+@app.post("/api/users")
+def create_user(body: UserIn, user: User = Depends(admin), db: Session = Depends(get_db)):
+    row = User(tenant_id=user.tenant_id, username=body.username,
+               password_hash=hash_password(body.password), role=body.role)
+    db.add(row)
+    try:
+        db.flush()
+        audit(db, user.tenant_id, user.username, "user_created", "user", row.id,
+              {"username": row.username, "role": row.role})
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Имя пользователя занято")
+    return serialize(row, ("id", "username", "role", "active"))
+
+
+@app.post("/api/users/{user_id}/deactivate")
+def deactivate_user(user_id: str, user: User = Depends(admin), db: Session = Depends(get_db)):
+    row = scoped(db, User, user.tenant_id, user_id)
+    if row.id == user.id:
+        raise HTTPException(409, "Нельзя отключить свою учётную запись")
+    if row.active:
+        row.active = False
+        audit(db, user.tenant_id, user.username, "user_deactivated", "user", row.id,
+              {"username": row.username, "role": row.role})
+        db.commit()
+    return serialize(row, ("id", "username", "role", "active"))
+
+
 @app.get("/api/dashboard")
 def dashboard(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    operational = metric_snapshot(db, user.tenant_id)
     statuses = {status: db.scalar(select(func.count()).select_from(Alert).where(Alert.tenant_id == user.tenant_id, Alert.status == status))
                 for status in ("queued", "running", "needs_review", "failed")}
     integrations = [integration_view(x)
@@ -200,37 +269,55 @@ def dashboard(user: User = Depends(current_user), db: Session = Depends(get_db))
                       "detail": "Проверка ещё не выполнялась"} for name in ("splunk", "thehive", "misp", "worker") if name not in present]
     return {"queue": statuses, "alerts_total": db.scalar(select(func.count()).select_from(Alert).where(Alert.tenant_id == user.tenant_id)),
             "investigations_total": db.scalar(select(func.count()).select_from(Investigation).where(Investigation.tenant_id == user.tenant_id)),
+            "classification_counts": operational["triage_results_total"],
+            "cases_created_total": operational["cases_created_total"],
+            "deduplicated_total": operational["alert_deduplicated_total"],
             "integrations": integrations, "mode": settings().mode.upper(),
             "automation_level": db.get(Tenant, user.tenant_id).automation_level}
 
 
 @app.get("/api/alerts")
-def alerts(status: str | None = None, verdict: str | None = None, search: str | None = None,
+def alerts(status: str | None = None, verdict: str | None = None,
+           classification: Classification | None = None, search: str | None = None,
            limit: int = 100, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    query = select(Alert, Investigation.verdict).join(Investigation, Alert.investigation_id == Investigation.id).where(Alert.tenant_id == user.tenant_id)
+    query = select(Alert, Investigation.verdict, Investigation.classification, Investigation.confidence).join(
+        Investigation, Alert.investigation_id == Investigation.id).where(Alert.tenant_id == user.tenant_id)
     if status:
         query = query.where(Alert.status == status)
     if verdict:
         query = query.where(Investigation.verdict == verdict)
+    if classification:
+        query = query.where(Investigation.classification == classification)
     if search:
         query = query.where(Alert.title.ilike(f"%{search[:100]}%"))
     rows = db.execute(query.order_by(Alert.received_at.desc()).limit(min(max(limit, 1), 500))).all()
-    return {"items": [{**serialize(a, ("id", "title", "rule", "severity", "status", "event_at", "received_at",
-                                    "source", "source_event_id", "investigation_id")), "verdict": v} for a, v in rows], "total": len(rows)}
+    return {"items": [{**serialize(a, ("id", "title", "rule", "severity", "status", "pipeline_state",
+                                    "event_at", "received_at", "source", "source_event_id", "investigation_id")),
+                       "verdict": v, "classification": c, "confidence": confidence}
+                      for a, v, c, confidence in rows], "total": len(rows)}
 
 
 @app.get("/api/investigations/{investigation_id}")
 def investigation(investigation_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     inv = scoped(db, Investigation, user.tenant_id, investigation_id)
-    return {**serialize(inv, ("id", "status", "verdict", "priority", "summary", "rationale", "missing_data",
+    return {**serialize(inv, ("id", "status", "verdict", "classification", "confidence",
+                              "priority", "summary", "rationale", "missing_data",
                               "recommended_actions", "playbook_key", "playbook_version", "analyzer", "created_at", "started_at", "completed_at", "due_at")),
-            "alerts": [serialize(x, ("id", "source_event_id", "title", "rule", "status", "event_at", "received_at", "raw"))
+            "alerts": [serialize(x, ("id", "source_event_id", "title", "rule", "status", "pipeline_state",
+                                     "event_at", "received_at", "raw"))
                        for x in db.scalars(select(Alert).where(Alert.tenant_id == user.tenant_id, Alert.investigation_id == inv.id)).all()],
+            "transitions": [serialize(x, ("id", "alert_id", "from_state", "to_state", "actor", "reason", "created_at"))
+                            for x in db.scalars(select(PipelineTransition).where(
+                                PipelineTransition.tenant_id == user.tenant_id,
+                                PipelineTransition.investigation_id == inv.id).order_by(
+                                    PipelineTransition.created_at, PipelineTransition.id)).all()],
             "evidence": [serialize(x, ("id", "kind", "source", "summary", "data", "event_at", "collected_at"))
                          for x in db.scalars(select(Evidence).where(Evidence.tenant_id == user.tenant_id, Evidence.investigation_id == inv.id)).all()],
             "playbook_runs": [serialize(x, ("id", "key", "version", "status", "steps", "started_at", "completed_at"))
                               for x in db.scalars(select(PlaybookRun).where(PlaybookRun.tenant_id == user.tenant_id, PlaybookRun.investigation_id == inv.id)).all()],
-            "decisions": [serialize(x, ("id", "verdict", "priority", "summary", "rationale", "evidence_ids", "missing_data", "recommended_actions", "actor", "created_at"))
+            "decisions": [serialize(x, ("id", "verdict", "classification", "confidence", "priority",
+                                        "summary", "rationale", "evidence_ids", "evidence_for", "evidence_against",
+                                        "missing_data", "recommended_actions", "actor", "created_at"))
                           for x in db.scalars(select(Decision).where(Decision.tenant_id == user.tenant_id, Decision.investigation_id == inv.id)).all()],
             "actions": [serialize(x, ("id", "kind", "status", "target", "external_id", "detail", "attempted_at", "completed_at"))
                         for x in db.scalars(select(Action).where(Action.tenant_id == user.tenant_id, Action.investigation_id == inv.id)).all()],
@@ -244,18 +331,32 @@ def investigation(investigation_id: str, user: User = Depends(current_user), db:
 
 
 @app.post("/api/investigations/{investigation_id}/review")
-def review(investigation_id: str, body: ReviewIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def review(investigation_id: str, body: ReviewIn, user: User = Depends(analyst), db: Session = Depends(get_db)):
     inv = scoped(db, Investigation, user.tenant_id, investigation_id)
+    if body.classification is None and body.verdict is None:
+        raise HTTPException(422, "Укажите классификацию")
+    classification = body.classification or classification_for_lane(body.verdict)
+    verdict = action_lane(classification)
+    if body.verdict is not None and body.verdict != verdict:
+        raise HTTPException(422, "Классификация и вердикт противоречат друг другу")
     evidence_ids = db.scalars(select(Evidence.id).where(Evidence.tenant_id == user.tenant_id, Evidence.investigation_id == inv.id)).all()
-    db.add(Decision(tenant_id=user.tenant_id, investigation_id=inv.id, verdict=body.verdict, priority=inv.priority,
+    db.add(Decision(tenant_id=user.tenant_id, investigation_id=inv.id, verdict=verdict,
+                    classification=classification, confidence=None, priority=inv.priority,
                     summary=inv.summary or "Ручная проверка", rationale=body.note, evidence_ids=list(evidence_ids),
                     missing_data=[], recommended_actions=[], actor=user.username))
-    inv.verdict, inv.rationale = body.verdict, body.note
-    inv.status = "needs_review" if body.verdict == "needs_review" else "completed"
+    inv.verdict, inv.classification, inv.confidence, inv.rationale = verdict, classification, None, body.note
+    inv.status = "needs_review" if verdict == "needs_review" else "completed"
     inv.completed_at = utcnow()
-    audit(db, user.tenant_id, user.username, "review", "investigation", inv.id, {"verdict": body.verdict})
+    if inv.status == "needs_review":
+        for alert in db.scalars(select(Alert).where(Alert.tenant_id == user.tenant_id,
+                                                   Alert.investigation_id == inv.id)).all():
+            if alert.pipeline_state == PipelineState.TRIAGED:
+                move_alert(db, alert, PipelineState.NEEDS_REVIEW, user.username, "manual_review")
+    audit(db, user.tenant_id, user.username, "review", "investigation", inv.id,
+          {"verdict": verdict, "classification": classification})
     db.commit()
-    return {"id": inv.id, "status": inv.status, "verdict": inv.verdict}
+    return {"id": inv.id, "status": inv.status, "verdict": inv.verdict,
+            "classification": inv.classification}
 
 
 @app.post("/api/investigations/{investigation_id}/actions/{kind}")
@@ -265,8 +366,8 @@ def manual_action(investigation_id: str, kind: Literal["create_case", "close_ale
     tenant = db.get(Tenant, user.tenant_id)
     if not can_manual_action(tenant, kind):
         raise HTTPException(403, "Действие не разрешено политикой")
-    if tenant.automation_level != "approved_response":
-        raise HTTPException(403, "Ручные действия требуют уровня approved_response")
+    if tenant.automation_level not in {"controlled_automation", "approved_response"}:
+        raise HTTPException(403, "Ручные действия требуют CONTROLLED_AUTOMATION")
     alert = db.scalar(select(Alert).where(Alert.tenant_id == user.tenant_id, Alert.investigation_id == inv.id).order_by(Alert.received_at))
     if not alert:
         raise HTTPException(409, "Нет алерта")
@@ -308,7 +409,7 @@ def set_case_status(case_id: str, body: CaseStatusIn, user: User = Depends(admin
     if not case:
         raise HTTPException(404, "Объект не найден")
     tenant = db.get(Tenant, user.tenant_id)
-    if tenant.automation_level != "approved_response" or not can_manual_action(tenant, "update_case"):
+    if tenant.automation_level not in {"controlled_automation", "approved_response"} or not can_manual_action(tenant, "update_case"):
         raise HTTPException(403, "Изменение статуса кейса не разрешено политикой")
     if not case.external_id:
         raise HTTPException(409, "Кейс ещё не подтверждён во внешней системе")
@@ -380,20 +481,135 @@ def update_asset(asset_id: str, body: AssetIn, user: User = Depends(admin), db: 
 
 @app.get("/api/exceptions")
 def exceptions(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    rows = db.scalars(select(ExceptionRule).where(ExceptionRule.tenant_id == user.tenant_id).order_by(ExceptionRule.valid_until.desc())).all()
-    return {"items": [serialize(x, ("id", "rule", "entity", "reason", "scope", "valid_from", "valid_until", "approved_by")) for x in rows]}
+    rows = db.scalars(select(ExceptionRule).where(ExceptionRule.tenant_id == user.tenant_id)
+                      .order_by(ExceptionRule.created_at.desc(), ExceptionRule.version.desc()).limit(300)).all()
+    return {"items": [exception_view(x) for x in rows]}
 
 
 @app.post("/api/exceptions")
 def create_exception(body: WindowIn, user: User = Depends(admin), db: Session = Depends(get_db)):
     valid_from, valid_until = checked_window(body.valid_from, body.valid_until)
-    row = ExceptionRule(tenant_id=user.tenant_id, rule=body.rule, entity=body.entity, reason=body.reason, scope=body.scope,
-                        valid_from=valid_from, valid_until=valid_until, approved_by=user.username)
+    row = ExceptionRule(tenant_id=user.tenant_id, rule=body.rule.strip(), entity=body.entity.strip(),
+                        owner=(body.owner or user.username).strip(), created_by=user.username,
+                        reason=body.reason.strip(), scope=body.scope, valid_from=valid_from,
+                        valid_until=valid_until, approval_status="draft", approved_by="",
+                        change_reason=body.change_reason.strip())
     db.add(row)
     db.flush()
-    audit(db, user.tenant_id, user.username, "exception_created", "exception", row.id, {"entity": body.entity})
+    record_event(db, row, user.username, "proposed", None, "draft")
+    audit(db, user.tenant_id, user.username, "exception_proposed", "exception", row.id,
+          {"policy_key": row.policy_key, "version": row.version, "rule_id": row.rule})
     db.commit()
-    return {"id": row.id}
+    return exception_view(row)
+
+
+@app.post("/api/exceptions/{exception_id}/versions")
+def create_exception_version(exception_id: str, body: PolicyVersionIn,
+                             user: User = Depends(admin), db: Session = Depends(get_db)):
+    if len(body.change_reason.strip()) < 10:
+        raise HTTPException(422, "Укажите причину изменения политики")
+    source = scoped(db, ExceptionRule, user.tenant_id, exception_id)
+    latest = db.scalar(select(ExceptionRule).where(ExceptionRule.tenant_id == user.tenant_id,
+        ExceptionRule.policy_key == source.policy_key).order_by(ExceptionRule.version.desc()).with_for_update().limit(1))
+    if source.id != latest.id:
+        raise HTTPException(409, "Новая версия создаётся от последней версии политики")
+    valid_from, valid_until = checked_window(body.valid_from, body.valid_until)
+    row = ExceptionRule(tenant_id=user.tenant_id, policy_key=source.policy_key, version=source.version + 1,
+                        rule=body.rule.strip(), entity=body.entity.strip(),
+                        owner=(body.owner or source.owner).strip(), created_by=user.username,
+                        reason=body.reason.strip(), scope=body.scope, valid_from=valid_from,
+                        valid_until=valid_until, approval_status="draft", approved_by="",
+                        change_reason=body.change_reason.strip())
+    db.add(row)
+    try:
+        db.flush()
+        record_event(db, row, user.username, "version_proposed", None, "draft",
+                     {"previous_version_id": source.id, "change_reason": row.change_reason})
+        audit(db, user.tenant_id, user.username, "exception_version_proposed", "exception", row.id,
+              {"policy_key": row.policy_key, "version": row.version, "previous_version_id": source.id})
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Версия политики уже создана")
+    return exception_view(row)
+
+
+@app.post("/api/exceptions/{exception_id}/approve")
+def approve_exception(exception_id: str, user: User = Depends(policy_approver), db: Session = Depends(get_db)):
+    row = db.scalar(select(ExceptionRule).where(ExceptionRule.tenant_id == user.tenant_id,
+        ExceptionRule.id == exception_id).with_for_update())
+    if not row:
+        raise HTTPException(404, "Объект не найден")
+    if row.approval_status != "draft":
+        raise HTTPException(409, "Утвердить можно только черновик политики")
+    if not row.created_by or row.created_by == user.username:
+        raise HTTPException(403, "Автор не может утвердить собственную политику")
+    latest = db.scalar(select(ExceptionRule.version).where(ExceptionRule.tenant_id == user.tenant_id,
+        ExceptionRule.policy_key == row.policy_key).order_by(ExceptionRule.version.desc()).limit(1))
+    if latest != row.version:
+        raise HTTPException(409, "Есть более новая версия политики")
+    denial = validate_contract(row)
+    if denial:
+        raise HTTPException(409, f"Политика не может быть утверждена: {denial}")
+    now = utcnow()
+    if policy_aware(row.valid_until) <= now:
+        raise HTTPException(409, "Срок действия политики истёк")
+    previous = db.scalars(select(ExceptionRule).where(ExceptionRule.tenant_id == user.tenant_id,
+        ExceptionRule.policy_key == row.policy_key, ExceptionRule.approval_status == "approved")
+        .with_for_update()).all()
+    for older in previous:
+        older.approval_status = "superseded"
+        older.revoked_at, older.revoked_by = now, user.username
+        older.revocation_reason = f"Superseded by version {row.version}"
+        record_event(db, older, user.username, "superseded", "approved", "superseded",
+                     {"new_policy_id": row.id, "new_version": row.version})
+        audit(db, user.tenant_id, user.username, "exception_superseded", "exception", older.id,
+              {"new_policy_id": row.id})
+    db.flush()  # release the one-approved-version constraint before approving the replacement
+    row.approval_status, row.approved_by, row.approved_at = "approved", user.username, now
+    record_event(db, row, user.username, "approved", "draft", "approved")
+    audit(db, user.tenant_id, user.username, "exception_approved", "exception", row.id,
+          {"policy_key": row.policy_key, "version": row.version, "rule_id": row.rule})
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Другая версия уже утверждена")
+    return exception_view(row)
+
+
+@app.post("/api/exceptions/{exception_id}/revoke")
+def revoke_exception(exception_id: str, body: PolicyRevokeIn,
+                     user: User = Depends(policy_revoker), db: Session = Depends(get_db)):
+    if len(body.reason.strip()) < 10:
+        raise HTTPException(422, "Укажите причину отзыва политики")
+    row = db.scalar(select(ExceptionRule).where(ExceptionRule.tenant_id == user.tenant_id,
+        ExceptionRule.id == exception_id).with_for_update())
+    if not row:
+        raise HTTPException(404, "Объект не найден")
+    if row.approval_status != "approved":
+        raise HTTPException(409, "Отозвать можно только действующее утверждение")
+    row.approval_status, row.revoked_at, row.revoked_by = "revoked", utcnow(), user.username
+    row.revocation_reason = body.reason.strip()
+    record_event(db, row, user.username, "revoked", "approved", "revoked",
+                 {"reason": row.revocation_reason})
+    audit(db, user.tenant_id, user.username, "exception_revoked", "exception", row.id,
+          {"policy_key": row.policy_key, "version": row.version, "reason": row.revocation_reason})
+    db.commit()
+    return exception_view(row)
+
+
+@app.get("/api/exceptions/{exception_id}/history")
+def exception_history(exception_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    row = scoped(db, ExceptionRule, user.tenant_id, exception_id)
+    versions = db.scalars(select(ExceptionRule).where(ExceptionRule.tenant_id == user.tenant_id,
+        ExceptionRule.policy_key == row.policy_key).order_by(ExceptionRule.version)).all()
+    ids = [x.id for x in versions]
+    events = db.scalars(select(PolicyEvent).where(PolicyEvent.tenant_id == user.tenant_id,
+        PolicyEvent.policy_id.in_(ids)).order_by(PolicyEvent.created_at, PolicyEvent.id)).all()
+    return {"policy_key": row.policy_key, "versions": [exception_view(x) for x in versions],
+            "events": [serialize(x, ("id", "policy_id", "actor", "event_type", "from_status",
+                                    "to_status", "detail", "created_at")) for x in events]}
 
 
 @app.get("/api/maintenance")
@@ -447,7 +663,7 @@ def misp_notices(user: User = Depends(current_user), db: Session = Depends(get_d
 
 
 @app.patch("/api/misp/notices/{notice_id}")
-def update_misp_notice(notice_id: str, body: MispNoticeUpdate, user: User = Depends(current_user),
+def update_misp_notice(notice_id: str, body: MispNoticeUpdate, user: User = Depends(analyst),
                        db: Session = Depends(get_db)):
     row = scoped(db, MispNotice, user.tenant_id, notice_id)
     if body.l1_status is None and body.l2_status is None:
@@ -487,7 +703,7 @@ def shifts(user: User = Depends(current_user), db: Session = Depends(get_db)):
 
 
 @app.post("/api/shifts")
-def create_shift(body: ShiftIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def create_shift(body: ShiftIn, user: User = Depends(analyst), db: Session = Depends(get_db)):
     try:
         ZoneInfo(body.timezone)
     except Exception:
@@ -554,7 +770,9 @@ def get_settings(user: User = Depends(current_user), db: Session = Depends(get_d
 def update_settings(body: SettingsIn, user: User = Depends(admin), db: Session = Depends(get_db)):
     tenant = db.get(Tenant, user.tenant_id)
     old = tenant.automation_level
-    if settings().mode.upper() == "CONNECTED" and body.automation_level != "observe" and not settings().connected_writes_enabled:
+    if (settings().mode.upper() == "CONNECTED" and
+            body.automation_level in {"controlled_automation", "auto_close", "approved_response"} and
+            not settings().connected_writes_enabled):
         raise HTTPException(409, "Операции записи CONNECTED не разрешены конфигурацией сервера")
     tenant.automation_level = body.automation_level
     audit(db, user.tenant_id, user.username, "automation_level_changed", "tenant", tenant.id,
@@ -581,6 +799,8 @@ def retry_dead_letter(letter_id: str, user: User = Depends(admin), db: Session =
     if letter.status != "open":
         raise HTTPException(409, "Задача уже повторена")
     alert = scoped(db, Alert, user.tenant_id, letter.alert_id)
+    if alert.pipeline_state == PipelineState.FAILED_PERMANENT:
+        move_alert(db, alert, PipelineState.FAILED_RETRYABLE, user.username, "manual_dead_letter_retry")
     alert.status, letter.status = "queued", "retried"
     audit(db, user.tenant_id, user.username, "dead_letter_retry", "alert", alert.id)
     db.commit()
@@ -624,7 +844,7 @@ def scenarios(user: User = Depends(current_user)):
 
 
 @app.post("/api/scenarios/{key}/run")
-def run_scenario(key: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def run_scenario(key: str, user: User = Depends(analyst), db: Session = Depends(get_db)):
     _check_demo()
     from .scenarios import SCENARIOS, instantiate_scenario
     try:
@@ -635,7 +855,7 @@ def run_scenario(key: str, user: User = Depends(current_user), db: Session = Dep
     event_at = datetime.fromisoformat(samples[0]["event_at"].replace("Z", "+00:00"))
     from datetime import timedelta
     raw = samples[0]["raw"]
-    if spec["expected_verdict"] == "false_positive" and raw.get("peer") and raw.get("tunnel") and raw.get("device"):
+    if spec["expected_classification"] in {"BENIGN_TRUE_POSITIVE", "NOISE"} and raw.get("peer") and raw.get("tunnel") and raw.get("device"):
         peer = str(raw["peer"])
         if not db.scalar(select(Asset).where(Asset.tenant_id == user.tenant_id, Asset.kind == "vpn_peer", Asset.value == peer)):
             db.add(Asset(tenant_id=user.tenant_id, kind="vpn_peer", value=peer, owner="DEMO: сеть",
@@ -771,11 +991,7 @@ async def import_dataset(file: UploadFile = File(...), path: str = "Data/2_Merge
 
 @app.get("/api/metrics")
 def metrics(user: User = Depends(admin), db: Session = Depends(get_db)):
-    counts = {status: db.scalar(select(func.count()).select_from(Alert).where(Alert.tenant_id == user.tenant_id, Alert.status == status))
-              for status in ("queued", "running", "failed", "needs_review", "auto_closed", "escalated")}
-    investigations = db.scalars(select(Investigation).where(Investigation.tenant_id == user.tenant_id,
-        Investigation.started_at.is_not(None), Investigation.completed_at.is_not(None))).all()
-    durations = [(x.completed_at - x.started_at).total_seconds() for x in investigations if x.completed_at and x.started_at]
-    return {"queue": counts, "processing_seconds_avg": sum(durations) / len(durations) if durations else None,
-            "dead_letters_open": db.scalar(select(func.count()).select_from(DeadLetter).where(
-                DeadLetter.tenant_id == user.tenant_id, DeadLetter.status == "open"))}
+    snapshot = metric_snapshot(db, user.tenant_id)
+    snapshot["dead_letters_open"] = db.scalar(select(func.count()).select_from(DeadLetter).where(
+        DeadLetter.tenant_id == user.tenant_id, DeadLetter.status == "open"))
+    return snapshot

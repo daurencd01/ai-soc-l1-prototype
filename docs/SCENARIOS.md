@@ -1,43 +1,46 @@
 # Демонстрационные сценарии
 
-Каталог находится в [`backend/app/scenarios.py`](../backend/app/scenarios.py), доступен через `/api/scenarios` и страницу «Демонстрационные сценарии». Каждый запуск создаёт новые идентификаторы, кроме специально устроенной пары `duplicate_delivery`. Ожидаемые исходы ниже являются критериями проверки; backend не подмешивает их в доказательства или запрос модели. Внешние действия в DEMO симулируются.
+Источник каталога — [`backend/app/scenarios.py`](../backend/app/scenarios.py). Он доступен через `/api/scenarios` и страницу «Демонстрационные сценарии». `expected_classification`, `expected_verdict` и `expected_action` — критерии проверки из каталога, а не поля, передаваемые анализатору как доказательства. Сценарии создают синтетические события только в DEMO.
 
-Ожидания автозакрытия в таблице относятся к **явному** запуску с `AUTO_CLOSE_ENABLED=true` и уровнем `auto_close` или `approved_response`. При настройке по умолчанию `AUTO_CLOSE_ENABLED=false` подходящие FP сохраняют вердикт, но получают статус `needs_review` без действия закрытия.
+В каталоге **34 сценария, один из них — `FP`**: `root_parser_false_positive`. Алерт заявляет успешный вход root, но отдельное событие Splunk с тем же `event_id` подтверждает отказ. Его `expected_action=manual_review` описывает настройки по умолчанию: `AUTO_CLOSE_ENABLED=false`, поэтому автоматического закрытия нет. Для демонстрации автозакрытия нужно **до запуска сценария** создать и отдельно утвердить действующую FP-политику для `root_ssh` с точным совпадением `host`, `src_ip`, `auth_method`, включить `AUTO_CLOSE_ENABLED=true` и установить уровень, разрешающий действие (`controlled_automation`, `auto_close` или `approved_response`). Ручное закрытие администратором допускается при действующей политике и уровне `controlled_automation` или `approved_response` даже при выключенном глобальном флаге. Закрытие в DEMO симулируется; базовый адаптер Splunk в CONNECTED не поддерживает закрытие алерта. Подтверждённая согласованная активность остаётся `BENIGN_TRUE_POSITIVE`, а повторные ошибки известного IPsec peer — `NOISE`; оба класса идут на проверку, а не в FP-закрытие. Создание кейса для `TP` зависит от разрешённого уровня действий и состояния симулятора TheHive.
 
-| Сценарий | Ожидаемый вердикт | Ожидаемая проверка действия |
-| --- | --- | --- |
-| `root_approved` | `false_positive` | Разрешённое автозакрытие |
-| `root_unapproved` | `true_positive` | Создание кейса |
-| `root_missing_context` | `needs_review` | Ручная проверка |
-| `root_expired_exception` | `needs_review` | Просроченное исключение не разрешает закрытие |
-| `vpn_new_country` | `true_positive` | Создание кейса |
-| `vpn_site_to_site_allowed` | `false_positive` | Разрешённое закрытие при подтверждённом peer |
-| `vpn_handshake_only` | `needs_review` | Согласование не считается установленной сессией |
-| `vpn_ip_in_user_field` | `needs_review` | IP не считается подтверждённой личностью |
-| `ipsec_configuration_failure` | `false_positive` | Разрешённое закрытие ошибки конфигурации |
-| `ipsec_unknown_peer_burst` | `needs_review` | Ручная проверка неизвестного peer |
-| `ipsec_failure_then_success` | `true_positive` | Создание кейса |
-| `bruteforce_success` | `true_positive` | Создание кейса |
-| `confirmed_test_incident` | `true_positive` | Создание кейса для подтверждённого теста |
-| `bruteforce_distributed` | `true_positive` | Создание кейса |
-| `bruteforce_approved_test` | `false_positive` | Разрешённое закрытие согласованного теста |
-| `powershell_encoded` | `true_positive` | Создание кейса, команда не исполняется |
-| `powershell_approved_admin` | `false_positive` | Разрешённое закрытие согласованной работы |
-| `powershell_missing_parent` | `needs_review` | Ручная проверка при нехватке контекста |
-| `unknown_rule` | `needs_review` | Общий плейбук |
-| `duplicate_delivery` | `false_positive` | Один исходный алерт и одно действие |
-| `linked_alerts` | `true_positive` | Два исходных алерта, одно расследование и один кейс |
-| `splunk_unavailable` | `needs_review` | Сбой обогащения отражён в статусе интеграции |
-| `thehive_unavailable` | `true_positive` | Кейс не показан как успешно созданный |
-| `misp_unavailable` | `needs_review` | Неизвестная репутация не считается безопасной |
-| `llm_error` | `needs_review` | Ошибка модели приводит к ручной проверке |
-| `prompt_injection_log` | `true_positive` | Инструкция внутри журнала не меняет политику |
-| `late_event` | `needs_review` | `event_at` и `received_at` учитываются раздельно |
-| `worker_restart` | `true_positive` | После рестарта нет повторного кейса |
-| `uncertain_action` | `true_positive` | `unknown` сверяется до повтора |
-| `tenant_isolation` | `needs_review` | Доступ к чужому заказчику запрещён сервером |
-| `private_ip_only` | `needs_review` | Частный IP сам по себе не разрешает закрытие |
-| `misp_no_hit_only` | `needs_review` | Отсутствие совпадений MISP не разрешает закрытие |
-| `failure_only` | `needs_review` | Один статус failure не определяет вердикт |
+| Сценарий | `expected_classification` | `expected_verdict` | `expected_action` |
+| --- | --- | --- | --- |
+| `root_approved` | `BENIGN_TRUE_POSITIVE` | `needs_review` | `manual_review` |
+| `root_unapproved` | `TP` | `true_positive` | `create_case` |
+| `root_missing_context` | `INCONCLUSIVE` | `needs_review` | `manual_review` |
+| `root_parser_false_positive` | `FP` | `false_positive` | `manual_review` |
+| `root_expired_exception` | `INCONCLUSIVE` | `needs_review` | `manual_review` |
+| `vpn_new_country` | `TP` | `true_positive` | `create_case` |
+| `vpn_site_to_site_allowed` | `BENIGN_TRUE_POSITIVE` | `needs_review` | `manual_review` |
+| `vpn_handshake_only` | `INCONCLUSIVE` | `needs_review` | `manual_review` |
+| `vpn_ip_in_user_field` | `INCONCLUSIVE` | `needs_review` | `manual_review` |
+| `ipsec_configuration_failure` | `NOISE` | `needs_review` | `manual_review` |
+| `ipsec_unknown_peer_burst` | `INCONCLUSIVE` | `needs_review` | `manual_review` |
+| `ipsec_failure_then_success` | `TP` | `true_positive` | `create_case` |
+| `bruteforce_success` | `TP` | `true_positive` | `create_case` |
+| `confirmed_test_incident` | `TP` | `true_positive` | `create_case` |
+| `bruteforce_distributed` | `TP` | `true_positive` | `create_case` |
+| `bruteforce_approved_test` | `BENIGN_TRUE_POSITIVE` | `needs_review` | `manual_review` |
+| `powershell_encoded` | `TP` | `true_positive` | `create_case` |
+| `powershell_approved_admin` | `BENIGN_TRUE_POSITIVE` | `needs_review` | `manual_review` |
+| `powershell_missing_parent` | `INCONCLUSIVE` | `needs_review` | `manual_review` |
+| `unknown_rule` | `INCONCLUSIVE` | `needs_review` | `manual_review` |
+| `duplicate_delivery` | `BENIGN_TRUE_POSITIVE` | `needs_review` | `one_alert_no_close` |
+| `linked_alerts` | `TP` | `true_positive` | `one_case` |
+| `splunk_unavailable` | `INCONCLUSIVE` | `needs_review` | `integration_degraded` |
+| `thehive_unavailable` | `TP` | `true_positive` | `case_failed` |
+| `misp_unavailable` | `INCONCLUSIVE` | `needs_review` | `integration_degraded` |
+| `llm_error` | `INCONCLUSIVE` | `needs_review` | `manual_review` |
+| `prompt_injection_log` | `TP` | `true_positive` | `create_case` |
+| `late_event` | `INCONCLUSIVE` | `needs_review` | `manual_review` |
+| `worker_restart` | `TP` | `true_positive` | `one_case` |
+| `uncertain_action` | `TP` | `true_positive` | `reconcile_case` |
+| `tenant_isolation` | `INCONCLUSIVE` | `needs_review` | `cross_tenant_forbidden` |
+| `private_ip_only` | `INCONCLUSIVE` | `needs_review` | `manual_review` |
+| `misp_no_hit_only` | `INCONCLUSIVE` | `needs_review` | `manual_review` |
+| `failure_only` | `INCONCLUSIVE` | `needs_review` | `manual_review` |
 
-Ожидаемое действие зависит от политики заказчика и состояния симулятора. После запуска проверяйте фактические записи в карточке расследования: алерты, доказательства, решения, действия, кейсы и журнал аудита. Для проверки восстановления worker надо действительно остановить и снова запустить worker после постановки алерта; запуск сценария сам по себе не моделирует рестарт процесса. Сценарий `tenant_isolation` поставляет тестовый алерт; проверку отказа при запросе чужого `tenant_id` надо выполнять отдельным API-тестом под пользователями разных заказчиков.
+`manual_review` означает передачу аналитику без автоматического закрытия при настройках сценария по умолчанию; дополнительные условия для FP описаны выше. `create_case` — запрос на симулированное создание кейса при разрешающей политике. `one_alert_no_close` проверяет дедупликацию двух доставок одного `source_event_id`; `one_case` — один кейс для связанных алертов или после восстановления worker. `integration_degraded` требует проверить недоступность источника и сохранённое доказательство сбоя. `case_failed` требует убедиться, что внешний кейс не отмечен успешно созданным при ошибке TheHive; точный статус локальной записи действия проверяется в журнале. `reconcile_case` требует сверки неопределённого результата до повтора. `cross_tenant_forbidden` требует отдельной проверки доступа из двух учётных записей.
+
+После запуска проверяйте фактические алерты, доказательства, решения, переходы состояний, действия и кейсы в карточке расследования. Для `worker_restart` действительно остановите worker после постановки алерта и запустите снова: запуск сценария сам по себе не моделирует рестарт. Для `tenant_isolation` создайте алерт от имени второго заказчика и попробуйте прочитать его ID под учётной записью первого; отказ должен подтвердить отдельный API-тест.

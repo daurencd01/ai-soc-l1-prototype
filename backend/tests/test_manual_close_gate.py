@@ -10,10 +10,11 @@ from sqlalchemy.pool import StaticPool
 from app.db import Base, get_db
 from app.main import app
 from app.models import (Action, Alert, Audit, Case, Decision, ExceptionRule, Investigation,
-                        Maintenance, Tenant, User, utcnow)
+                        Maintenance, PolicyEvent, Tenant, User, utcnow)
 from app.scenarios import instantiate_scenario
 from app.security import hash_password, token_for
 from app.workflow import ingest, process_alert
+import app.workflow as workflow
 
 
 @pytest.fixture
@@ -49,9 +50,16 @@ def prepare(engine, tenant_id: str, *, scenario: str = "root_approved", policy: 
         window = {"valid_from": utcnow() - timedelta(hours=1),
                   "valid_until": utcnow() + timedelta(hours=1)}
         if policy:
-            db.add(ExceptionRule(tenant_id=tenant_id, rule="root_ssh", entity=raw["host"],
-                                 reason="Проверенное исключение FP", scope=scope,
-                                 approved_by="policy-approver", **window))
+            row = ExceptionRule(tenant_id=tenant_id, rule="root_ssh", entity=raw["host"],
+                                owner="SOC", created_by="policy-admin", reason="Проверенное исключение FP",
+                                scope=scope, approval_status="approved", approved_by="policy-approver",
+                                approved_at=utcnow(), **window)
+            db.add(row)
+            db.flush()
+            db.add(PolicyEvent(tenant_id=tenant_id, policy_id=row.id, actor="policy-approver",
+                               event_type="approved", from_status="draft", to_status="approved"))
+            db.add(Audit(tenant_id=tenant_id, actor="policy-approver", operation="exception_approved",
+                         subject_type="exception", subject_id=row.id))
         else:
             # The playbook can still classify the event as FP from maintenance.
             # Manual closing additionally requires a current FP exception.
@@ -59,11 +67,11 @@ def prepare(engine, tenant_id: str, *, scenario: str = "root_approved", policy: 
                                reason="Администрирование", scope=scope, approved_by="admin", **window))
         db.commit()
         alert, _ = ingest(db, tenant_id, payload)
-        process_alert(db, alert.id)
-        inv = db.get(Investigation, alert.investigation_id)
         tenant = db.get(Tenant, tenant_id)
         tenant.automation_level = "approved_response"
         db.commit()
+        process_alert(db, alert.id)
+        inv = db.get(Investigation, alert.investigation_id)
         return inv.id
 
 
@@ -84,14 +92,14 @@ def assert_denied(engine, tenant_id: str, result, expected_code: str):
 
 def test_manual_close_requires_current_approved_fp_policy(site):
     engine, client, ids = site
-    inv_id = prepare(engine, ids["tenant"], policy=False)
+    inv_id = prepare(engine, ids["tenant"], scenario="root_parser_false_positive", policy=False)
     assert_denied(engine, ids["tenant"], close(client, ids["admin"], inv_id),
                   "no_current_approved_policy")
 
 
 def test_manual_close_blocks_critical_alert_even_with_policy(site):
     engine, client, ids = site
-    inv_id = prepare(engine, ids["tenant"])
+    inv_id = prepare(engine, ids["tenant"], scenario="root_parser_false_positive")
     with Session(engine) as db:
         alert = db.scalar(select(Alert).where(Alert.investigation_id == inv_id))
         alert.severity = "critical"
@@ -116,9 +124,10 @@ def test_manual_close_blocks_linked_case_even_after_verdict_correction(site):
 
 def test_manual_close_blocks_missing_decision_evidence(site):
     engine, client, ids = site
-    inv_id = prepare(engine, ids["tenant"])
+    inv_id = prepare(engine, ids["tenant"], scenario="root_parser_false_positive")
     with Session(engine) as db:
-        decision = db.scalar(select(Decision).where(Decision.investigation_id == inv_id))
+        decision = db.scalar(select(Decision).where(Decision.investigation_id == inv_id)
+                             .order_by(Decision.created_at.desc(), Decision.id.desc()).limit(1))
         decision.evidence_ids = []
         db.commit()
     assert_denied(engine, ids["tenant"], close(client, ids["admin"], inv_id), "insufficient_evidence")
@@ -136,7 +145,7 @@ def test_verdict_correction_cannot_override_inconclusive_playbook(site):
 
 def test_manual_close_policy_must_still_be_valid_and_success_is_idempotent(site):
     engine, client, ids = site
-    inv_id = prepare(engine, ids["tenant"])
+    inv_id = prepare(engine, ids["tenant"], scenario="root_parser_false_positive")
     with Session(engine) as db:
         policy = db.scalar(select(ExceptionRule).where(ExceptionRule.tenant_id == ids["tenant"]))
         policy.valid_until = utcnow() - timedelta(minutes=1)
@@ -158,3 +167,31 @@ def test_manual_close_policy_must_still_be_valid_and_success_is_idempotent(site)
             Action.tenant_id == ids["tenant"], Action.kind == "close_alert")) == 1
         grant = db.scalar(select(Audit).where(Audit.operation == "manual_close_granted").limit(1))
         assert grant and grant.detail["policy_ids"] and grant.detail["decision_id"]
+
+
+def test_real_fp_detection_can_close_with_current_approved_policy(site):
+    engine, client, ids = site
+    inv_id = prepare(engine, ids["tenant"], scenario="root_parser_false_positive")
+    with Session(engine) as db:
+        inv = db.get(Investigation, inv_id)
+        assert inv.classification == "FP"
+        assert db.scalar(select(func.count()).select_from(Action).where(
+            Action.investigation_id == inv_id, Action.kind == "close_alert")) == 0
+        decision = db.scalar(select(Decision).where(Decision.investigation_id == inv_id))
+        assert decision.evidence_against and decision.evidence_against[0]["evidence_id"]
+    result = close(client, ids["admin"], inv_id)
+    assert result.status_code == 200, result.text
+    assert result.json()["status"] == "succeeded"
+
+
+def test_real_fp_auto_close_requires_global_flag(site, monkeypatch):
+    engine, _, ids = site
+    monkeypatch.setattr(workflow.settings(), "auto_close_enabled", True)
+    inv_id = prepare(engine, ids["tenant"], scenario="root_parser_false_positive")
+    with Session(engine) as db:
+        inv = db.get(Investigation, inv_id)
+        alert = db.scalar(select(Alert).where(Alert.investigation_id == inv_id))
+        assert inv.classification == "FP" and alert.pipeline_state == "CLOSED_FP"
+        actions = db.scalars(select(Action).where(Action.investigation_id == inv_id,
+                                                  Action.kind == "close_alert")).all()
+        assert len(actions) == 1 and actions[0].status == "succeeded"

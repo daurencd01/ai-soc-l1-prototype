@@ -1,5 +1,4 @@
 from datetime import timedelta, datetime, timezone
-from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select
@@ -47,19 +46,20 @@ def test_full_demo_decisions_actions_and_deduplication(monkeypatch):
         assert created
         process_alert(db, alert.id)
         inv = db.get(Investigation, alert.investigation_id)
-        assert inv.verdict == "false_positive"
-        assert inv.status == "auto_closed"
+        assert inv.classification == "BENIGN_TRUE_POSITIVE"
+        assert inv.verdict == "needs_review" and inv.status == "needs_review"
         assert db.scalar(select(func.count()).select_from(Evidence).where(Evidence.tenant_id == owner.id)) >= 2
         assert db.scalar(select(func.count()).select_from(Decision).where(Decision.tenant_id == owner.id)) == 1
         again, created = ingest(db, owner.id, approved)
         assert not created and again.id == alert.id
         process_alert(db, again.id)
-        assert db.scalar(select(func.count()).select_from(Action).where(Action.tenant_id == owner.id)) == 1
+        assert db.scalar(select(func.count()).select_from(Action).where(Action.tenant_id == owner.id)) == 0
 
         suspicious = instantiate_scenario("root_unapproved")[0]
         bad, _ = ingest(db, owner.id, suspicious)
         process_alert(db, bad.id)
         bad_inv = db.get(Investigation, bad.investigation_id)
+        assert bad_inv.classification == "TP"
         assert bad_inv.verdict == "true_positive" and bad_inv.status == "escalated"
         assert db.scalar(select(func.count()).select_from(Case).where(Case.tenant_id == owner.id)) == 1
         process_alert(db, bad.id)
@@ -71,7 +71,7 @@ def test_full_demo_decisions_actions_and_deduplication(monkeypatch):
         assert db.get(Investigation, item.investigation_id).verdict == "needs_review"
 
 
-def test_auto_close_is_disabled_by_default_even_for_eligible_demo_alert():
+def test_auto_close_is_disabled_by_default_and_benign_event_is_not_fp():
     assert settings().auto_close_enabled is False
     with Session(database()) as db:
         owner = tenant(db)
@@ -80,7 +80,8 @@ def test_auto_close_is_disabled_by_default_even_for_eligible_demo_alert():
         alert, _ = ingest(db, owner.id, payload)
         process_alert(db, alert.id)
         inv = db.get(Investigation, alert.investigation_id)
-        assert inv.verdict == "false_positive"
+        assert inv.classification == "BENIGN_TRUE_POSITIVE"
+        assert inv.verdict == "needs_review"
         assert inv.status == "needs_review"
         assert db.scalar(select(func.count()).select_from(Action).where(
             Action.tenant_id == owner.id, Action.kind == "close_alert")) == 0

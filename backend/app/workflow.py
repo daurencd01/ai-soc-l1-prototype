@@ -10,11 +10,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .adapters import AdapterError, splunk_adapter, thehive_adapter, misp_adapter
 from .analyzer import model_analyze
+from .case_builder import build_case_plan
 from .config import settings
-from .models import (Action, Alert, Asset, Audit, Case, CaseWrite, Decision, EmbeddedEvent, Evidence,
+from .models import (Action, Alert, Asset, Case, CaseWrite, Decision, EmbeddedEvent, Evidence,
                      ExceptionRule, IntegrationState, Investigation, Maintenance, PlaybookRun, Tenant, utcnow)
 from .playbooks import select_playbook
+from .policy import is_effective
 from .security import audit
+from .state import PipelineState, move_alert, record_initial
 
 
 def aware(dt: datetime) -> datetime:
@@ -28,6 +31,9 @@ def ingest(db: Session, tenant_id: str, payload: dict, _attempt: int = 0) -> tup
         raise ValueError("source_event_id обязателен")
     existing = db.scalar(select(Alert).where(Alert.tenant_id == tenant_id, Alert.source == source, Alert.source_event_id == source_id))
     if existing:
+        audit(db, tenant_id, "ingest", "alert_deduplicated", "alert", existing.id,
+              {"source": source, "source_event_id": source_id})
+        db.commit()
         return existing, False
     raw_time = payload["event_at"]
     source_time = (datetime.fromtimestamp(float(raw_time), timezone.utc) if isinstance(raw_time, (int, float)) or
@@ -54,6 +60,7 @@ def ingest(db: Session, tenant_id: str, payload: dict, _attempt: int = 0) -> tup
                   event_at=event_at, original_timezone=str(payload.get("original_timezone") or source_time.tzinfo)[:80], raw=raw)
     db.add(alert)
     db.flush()
+    record_initial(db, alert)
     for idx, event in enumerate((payload.get("events") or [])[:100]):
         if isinstance(event, dict):
             dt = event.get("event_at")
@@ -75,6 +82,9 @@ def ingest(db: Session, tenant_id: str, payload: dict, _attempt: int = 0) -> tup
         db.rollback()
         existing = db.scalar(select(Alert).where(Alert.tenant_id == tenant_id, Alert.source == source, Alert.source_event_id == source_id))
         if existing:
+            audit(db, tenant_id, "ingest", "alert_deduplicated", "alert", existing.id,
+                  {"source": source, "source_event_id": source_id})
+            db.commit()
             return existing, False
         if _attempt == 0:
             return ingest(db, tenant_id, payload, _attempt=1)
@@ -105,6 +115,9 @@ def _integration(db: Session, tenant_id: str, name: str, status: str, detail: st
     row.last_checked_at = utcnow()
     if received:
         row.last_received_at = utcnow()
+    if status == "unavailable":
+        audit(db, tenant_id, "integration", "integration_error", "integration", name,
+              {"error_type": detail[:100]})
 
 
 def collect(db: Session, alert: Alert, inv: Investigation) -> tuple[list[Evidence], bool, list[dict]]:
@@ -132,11 +145,13 @@ def collect(db: Session, alert: Alert, inv: Investigation) -> tuple[list[Evidenc
     for entity in entities[:10]:
         for exc in db.scalars(select(ExceptionRule).where(ExceptionRule.tenant_id == inv.tenant_id,
                       ExceptionRule.entity == entity, ExceptionRule.rule.in_([alert.rule, "*"]))).all():
-            scope_matches = bool(exc.scope) and all(raw.get(k) == v for k, v in exc.scope.items())
-            active = aware(exc.valid_from) <= aware(alert.event_at) < aware(exc.valid_until) and scope_matches
+            active = is_effective(db, exc, raw, alert.event_at)
             _ev(db, inv, "active_exception" if active else "expired_exception", "local_policy",
-                f"Исключение {exc.id}: {'действует' if active else 'не действует или не совпадает область'}", {"entity": entity, "reason": exc.reason, "scope": exc.scope,
-                "valid_from": exc.valid_from.isoformat(), "valid_until": exc.valid_until.isoformat(), "approved_by": exc.approved_by})
+                f"Исключение {exc.id}: {'действует' if active else 'не утверждено, отозвано, истекло или не совпадает область'}",
+                {"policy_id": exc.id, "entity": entity, "reason": exc.reason, "scope": exc.scope,
+                 "version": exc.version, "approval_status": exc.approval_status,
+                 "valid_from": exc.valid_from.isoformat(), "valid_until": exc.valid_until.isoformat(),
+                 "approved_by": exc.approved_by})
         for work in db.scalars(select(Maintenance).where(Maintenance.tenant_id == inv.tenant_id,
                        Maintenance.entity == entity)).all():
             if aware(work.valid_from) <= aware(alert.event_at) < aware(work.valid_until) and work.scope and all(raw.get(k) == v for k, v in work.scope.items()):
@@ -187,13 +202,12 @@ def can_act(tenant: Tenant, kind: str) -> bool:
     if tenant.deployment_mode != mode:
         return False
     level = tenant.automation_level
-    if level == "observe":
+    if level in {"disabled", "observe", "recommend"}:
         return False
-    if kind == "close_alert" and level not in {"auto_close", "approved_response"}:
+    if level not in {"controlled_automation", "auto_close", "approved_response"}:
         return False
-    if kind == "create_case" and level not in {"auto_close", "approved_response"}:
-        return False
-    if kind in {"update_case", "disable_account_demo", "isolate_host_demo"} and level != "approved_response":
+    if kind in {"update_case", "disable_account_demo", "isolate_host_demo"} and level not in {
+            "controlled_automation", "approved_response"}:
         return False
     if mode == "DEMO":
         return kind in {"close_alert", "create_case", "update_case", "disable_account_demo", "isolate_host_demo"}
@@ -228,8 +242,8 @@ def manual_close_gate(db: Session, tenant: Tenant, inv: Investigation, evidence:
     def deny(code: str, message: str) -> None:
         raise ManualCloseDenied(code, message)
 
-    if inv.verdict != "false_positive":
-        deny("verdict", "Закрытие требует подтверждённого вердикта false_positive")
+    if inv.verdict != "false_positive" or inv.classification != "FP":
+        deny("verdict", "Закрытие требует подтверждённой классификации FP")
     linked = db.scalars(select(Alert).where(Alert.tenant_id == tenant.id,
         Alert.investigation_id == inv.id).with_for_update()).all()
     if not linked:
@@ -252,7 +266,8 @@ def manual_close_gate(db: Session, tenant: Tenant, inv: Investigation, evidence:
         deny("insufficient_evidence", "Исходное событие отсутствует в доказательствах")
     decision = db.scalar(select(Decision).where(Decision.tenant_id == tenant.id,
         Decision.investigation_id == inv.id).order_by(Decision.created_at.desc(), Decision.id.desc()).limit(1))
-    if (not decision or decision.verdict != "false_positive" or decision.missing_data
+    if (not decision or decision.verdict != "false_positive" or decision.classification != "FP"
+            or decision.missing_data
             or not isinstance(decision.evidence_ids, list) or not decision.evidence_ids
             or any(not isinstance(item, str) for item in decision.evidence_ids)
             or not set(decision.evidence_ids).issubset(evidence_by_id)):
@@ -288,15 +303,10 @@ def manual_close_gate(db: Session, tenant: Tenant, inv: Investigation, evidence:
         candidates = db.scalars(select(ExceptionRule).where(ExceptionRule.tenant_id == tenant.id,
             ExceptionRule.rule == alert.rule, ExceptionRule.entity.in_(entities))).all() if entities else []
         matched = next((rule for rule in candidates
-            if rule.reason and rule.reason.strip() and rule.approved_by and rule.approved_by.strip()
-            and aware(rule.valid_from) <= aware(alert.event_at) < aware(rule.valid_until)
-            and aware(rule.valid_from) <= now < aware(rule.valid_until)
-            and isinstance(rule.scope, dict) and rule.scope
-            and all(isinstance(key, str) and isinstance(value, str) and value
-                    for key, value in rule.scope.items())
-            and all(raw.get(key) == value for key, value in rule.scope.items())
+            if is_effective(db, rule, raw, alert.event_at, now)
             and all(rule.scope.get(key) == raw[key] for key in required_scope)
             and any(e.kind == "active_exception" and isinstance(e.data, dict)
+                    and e.data.get("policy_id") == rule.id
                     and e.data.get("entity") == rule.entity
                     and e.data.get("approved_by") == rule.approved_by
                     and e.data.get("scope") == rule.scope for e in scoped_evidence)), None)
@@ -427,43 +437,23 @@ def _case_write_plan(db: Session, tenant: Tenant, inv: Investigation, case: Case
         return existing
     alerts = db.scalars(select(Alert).where(Alert.tenant_id == tenant.id,
         Alert.investigation_id == inv.id).order_by(Alert.event_at, Alert.id)).all()
-    alert_lines = [f"{item.source}:{item.source_event_id} | {aware(item.event_at).isoformat()} | {item.rule}"
-                   for item in alerts[:50]]
-    description = "\n".join([
-        "SOC L1: создано по подтверждённой эскалации.",
-        f"Расследование: {inv.id}",
-        f"Плейбук: {inv.playbook_key} {inv.playbook_version}",
-        f"Вердикт: {inv.verdict or 'не определён'}; приоритет: {inv.priority}",
-        f"Анализатор: {inv.analyzer}",
-        f"Вывод: {inv.rationale[:3000]}",
-        "Исходные алерты:", *alert_lines,
-        f"Недостающие данные: {', '.join(str(x) for x in inv.missing_data[:20]) or 'не указаны'}",
-        f"Рекомендации: {', '.join(str(x) for x in inv.recommended_actions[:20]) or 'проверить аналитиком'}",
-    ])[:10_000]
-    page_content = "\n".join(
-        f"{item.id} | {item.kind} | {item.source} | {aware(item.event_at).isoformat() if item.event_at else 'время неизвестно'} | {item.summary[:300]}"
-        for item in evidence[:50]
-    )[:20_000]
-    steps: list[tuple[str, dict, str]] = [
-        ("create_case", {"title": inv.summary[:300], "description": description}, action.idempotency_key),
-        ("evidence_page", {"title": "Доказательства SOC L1", "category": "SOC L1",
-                           "content": page_content or "Доказательства пока не представлены."}, ""),
-    ]
-    seen_observables: set[tuple[str, str]] = set()
-    for item in evidence[:20]:
-        data = item.data if isinstance(item.data, dict) else {}
-        value = data.get("observable")
-        if value is None or not str(value).strip():
-            continue
-        data_type = str(data.get("observable_type") or "ip")[:60]
-        value_text = str(value)[:1000]
-        signature = (data_type, value_text)
-        if signature in seen_observables:
-            continue
-        seen_observables.add(signature)
-        steps.append(("observable", {"dataType": data_type, "data": value_text,
-                                     "message": item.summary[:500]}, ""))
-    steps.append(("task", {"title": "Проверить и принять эскалацию SOC L1"}, ""))
+    decision = db.scalar(select(Decision).where(Decision.tenant_id == tenant.id,
+        Decision.investigation_id == inv.id).order_by(Decision.created_at.desc(), Decision.id.desc()).limit(1))
+    for_claims = getattr(decision, "evidence_for", []) or []
+    against_claims = getattr(decision, "evidence_against", []) or []
+    plan = build_case_plan(inv, alerts, evidence, decision=decision,
+        evidence_for_ids=[claim["evidence_id"] for claim in for_claims if isinstance(claim, dict)
+                          and isinstance(claim.get("evidence_id"), str)],
+        evidence_against_ids=[claim["evidence_id"] for claim in against_claims if isinstance(claim, dict)
+                              and isinstance(claim.get("evidence_id"), str)])
+    create_payload = dict(plan.create_case)
+    create_payload["severity"] = {"low": 1, "medium": 2, "high": 3, "critical": 4}[plan.create_case["severity"]]
+    create_payload["startDate"] = int(datetime.fromisoformat(plan.metadata["interval_start"]).timestamp() * 1000)
+    create_payload["endDate"] = int(datetime.fromisoformat(plan.metadata["interval_end"]).timestamp() * 1000)
+    case.title = plan.create_case["title"]
+    case.data = {**(case.data or {}), **plan.metadata}
+    steps: list[tuple[str, dict, str]] = [("create_case", create_payload, action.idempotency_key)]
+    steps.extend((kind, payload, "") for kind, payload in plan.steps)
     writes = [CaseWrite(tenant_id=tenant.id, investigation_id=inv.id, case_id=case.id,
                         sequence=index, kind=kind, idempotency_key=key or _case_step_key(case.id, kind, payload),
                         request_data=payload, status="pending", attempts=0)
@@ -564,7 +554,10 @@ def _perform_case_action(db: Session, tenant: Tenant, inv: Investigation, alert:
                 if alert.raw.get("scenario_signal") == "thehive_unavailable" and settings().mode.upper() == "DEMO":
                     raise AdapterError("Симулированная недоступность TheHive")
                 result = hive.create_case(write.request_data["title"], write.request_data["description"],
-                                          write.idempotency_key)
+                                          write.idempotency_key, severity=write.request_data["severity"],
+                                          tags=write.request_data["tags"],
+                                          start_date=write.request_data["startDate"],
+                                          end_date=write.request_data["endDate"])
             else:
                 result = hive.write_case_step(case.external_id, write.kind, write.request_data,
                                               write.idempotency_key)
@@ -594,7 +587,7 @@ def _perform_case_action(db: Session, tenant: Tenant, inv: Investigation, alert:
     action.attempted_at = utcnow()
     action.completed_at = utcnow()
     case.status = "open"
-    case.data = {"demo": settings().mode.upper() == "DEMO",
+    case.data = {**(case.data or {}), "demo": settings().mode.upper() == "DEMO",
                  "evidence_ids": [item.id for item in evidence[:50]],
                  "observables": [item.request_data for item in writes if item.kind == "observable"],
                  "tasks": [item.request_data["title"] for item in writes if item.kind == "task"],
@@ -609,6 +602,19 @@ def _perform_case_action(db: Session, tenant: Tenant, inv: Investigation, alert:
 def perform_action(db: Session, tenant: Tenant, inv: Investigation, alert: Alert, kind: str,
                    evidence: list[Evidence]) -> Action | None:
     if not can_act(tenant, kind):
+        return None
+    if kind == "close_alert":
+        try:
+            manual_close_gate(db, tenant, inv, evidence)
+        except ManualCloseDenied as exc:
+            audit(db, tenant.id, "policy", "close_gate_denied", "investigation", inv.id,
+                  {"reason": exc.code, "alert_id": alert.id})
+            db.commit()
+            return None
+    if kind == "create_case" and (inv.verdict != "true_positive" or inv.classification != "TP"):
+        audit(db, tenant.id, "policy", "action_denied_conflict", "investigation", inv.id,
+              {"kind": kind, "reason": "unconfirmed_tp"})
+        db.commit()
         return None
     # Serialize competing case creation and alert closure on the investigation.
     # The pending action is committed before an external call, so the next worker
@@ -635,6 +641,9 @@ def perform_action(db: Session, tenant: Tenant, inv: Investigation, alert: Alert
     action = db.scalar(select(Action).where(Action.tenant_id == tenant.id, Action.idempotency_key == key))
     if action and action.status == "succeeded":
         return action
+    if kind in {"create_case", "close_alert"}:
+        pending_state = PipelineState.CASE_PENDING if kind == "create_case" else PipelineState.CLOSE_PENDING
+        move_alert(db, alert, pending_state, "policy", "authorized_external_action")
     if not action:
         action = Action(tenant_id=tenant.id, investigation_id=inv.id, kind=kind, status="pending",
                         idempotency_key=key, target=alert.source_event_id if kind == "close_alert" else inv.id,
@@ -658,12 +667,19 @@ def perform_action(db: Session, tenant: Tenant, inv: Investigation, alert: Alert
         action.status = "unknown"
         db.commit()
     if kind == "create_case":
-        return _perform_case_action(db, tenant, inv, alert, evidence, action)
+        result = _perform_case_action(db, tenant, inv, alert, evidence, action)
+        move_alert(db, alert, PipelineState.CASE_CREATED if result.status == "succeeded"
+                   else PipelineState.NEEDS_REVIEW, "worker", "case_write_" + result.status)
+        db.commit()
+        return result
     try:
         if action.status == "unknown":
             if kind == "close_alert" and settings().mode.upper() == "DEMO":
                 external_id = f"demo-close:{alert.source_event_id}"
             else:
+                if kind == "close_alert":
+                    move_alert(db, alert, PipelineState.NEEDS_REVIEW, "worker", "close_outcome_unknown")
+                    db.commit()
                 return action
         elif kind == "close_alert":
             splunk = splunk_adapter()
@@ -691,6 +707,9 @@ def perform_action(db: Session, tenant: Tenant, inv: Investigation, alert: Alert
         _integration(db, tenant.id, "splunk", "unavailable", type(exc).__name__)
         audit(db, tenant.id, "worker", "action_failed_or_unknown", "action", action.id,
               {"kind": kind, "status": action.status, "error_type": type(exc).__name__})
+    if kind == "close_alert":
+        move_alert(db, alert, PipelineState.CLOSED_FP if action.status == "succeeded"
+                   else PipelineState.NEEDS_REVIEW, "worker", "close_" + action.status)
     db.commit()
     return action
 
@@ -699,6 +718,9 @@ def process_alert(db: Session, alert_id: str) -> None:
     deadline = monotonic() + max(settings().investigation_timeout_seconds, 1)
     alert = db.scalar(select(Alert).where(Alert.id == alert_id).with_for_update())
     if not alert or alert.status in {"completed", "auto_closed", "escalated"}:
+        return
+    if alert.pipeline_state in {PipelineState.CASE_CREATED, PipelineState.CLOSED_FP,
+                                PipelineState.SUPPRESSED, PipelineState.FAILED_PERMANENT}:
         return
     if alert.status == "running" and alert.claimed_at and utcnow() - aware(alert.claimed_at) < timedelta(minutes=2):
         return
@@ -709,6 +731,12 @@ def process_alert(db: Session, alert_id: str) -> None:
         raise RuntimeError("Связи заказчика или расследования не найдены")
     if inv.status == "running" and inv.claimed_at and utcnow() - aware(inv.claimed_at) < timedelta(minutes=2):
         return
+    if alert.pipeline_state in {PipelineState.VALIDATED, PipelineState.ENRICHING,
+                                PipelineState.TRIAGING, PipelineState.TRIAGED,
+                                PipelineState.CASE_PENDING, PipelineState.CLOSE_PENDING}:
+        move_alert(db, alert, PipelineState.FAILED_RETRYABLE, "worker", "stale_claim_retried")
+    move_alert(db, alert, PipelineState.VALIDATED, "worker", "payload_validated")
+    move_alert(db, alert, PipelineState.ENRICHING, "worker", "evidence_collection_started")
     inv.status = "running"
     inv.started_at = inv.started_at or utcnow()
     inv.claimed_at = utcnow()
@@ -719,11 +747,26 @@ def process_alert(db: Session, alert_id: str) -> None:
     db.add(run)
     db.commit()
     evidence, context_ok, steps = collect(db, alert, inv)
+    current_evidence = []
+    for item in evidence:
+        if item.kind != "active_exception":
+            current_evidence.append(item)
+            continue
+        policy_id = item.data.get("policy_id") if isinstance(item.data, dict) else None
+        policy = db.get(ExceptionRule, policy_id) if policy_id else None
+        if policy and policy.tenant_id == tenant.id and is_effective(db, policy, alert.raw, alert.event_at):
+            current_evidence.append(item)
+    if len(current_evidence) != len(evidence):
+        steps.append({"step": "stale_policy_evidence", "status": "excluded",
+                      "count": len(evidence) - len(current_evidence)})
+    evidence = current_evidence
     if len(evidence) > settings().max_evidence_items:
         evidence = evidence[:settings().max_evidence_items]
         context_ok = False
         steps.append({"step": "evidence_limit", "status": "limited"})
     records = [{"id": e.id, "kind": e.kind, "source": e.source, "summary": e.summary, "data": e.data} for e in evidence]
+    move_alert(db, alert, PipelineState.TRIAGING, "worker", "triage_started")
+    db.commit()
     baseline = playbook.decision_rule(alert.raw, records, context_ok)
     if monotonic() >= deadline:
         from .playbooks import Verdict
@@ -749,46 +792,66 @@ def process_alert(db: Session, alert_id: str) -> None:
                                recommended_actions=["review"])
             analyzer = "timeout"
             steps.append({"step": "time_budget", "status": "limited"})
-    if analyzer in {"local_model", "external_model"} and decision.verdict != baseline.verdict:
+    if analyzer in {"local_model", "external_model"} and decision.classification != baseline.classification:
         from .playbooks import Verdict
         decision = Verdict(verdict="needs_review", priority=baseline.priority,
                            summary="Требуется ручная проверка расхождения",
-                           rationale="Вердикт модели не совпал с проверяемым правилом плейбука; автоматическое действие запрещено.",
+                           rationale="Классификация модели не совпала с проверяемым правилом плейбука; автоматическое действие запрещено.",
                            evidence_ids=[e.id for e in evidence],
                            missing_data=["Проверить причину расхождения модели и плейбука"],
                            recommended_actions=["review"])
         steps.append({"step": "model_disagreement", "status": "needs_review"})
     known_ids = {e.id for e in evidence}
-    if not set(decision.evidence_ids).issubset(known_ids) or (decision.verdict != "needs_review" and not decision.evidence_ids):
+    claim_ids = {claim.evidence_id for claim in decision.evidence_for + decision.evidence_against}
+    if (not set(decision.evidence_ids).issubset(known_ids) or not claim_ids.issubset(known_ids)
+            or (decision.classification != "INCONCLUSIVE" and not decision.evidence_ids)):
         raise ValueError("Решение с некорректными доказательствами")
     inv.playbook_key, inv.playbook_version = playbook.key, playbook.version
     inv.verdict, inv.priority = decision.verdict, decision.priority
+    inv.classification, inv.confidence = decision.classification, decision.confidence
     inv.summary, inv.rationale = decision.summary, decision.rationale
     inv.missing_data, inv.recommended_actions = decision.missing_data, decision.recommended_actions
     inv.analyzer = analyzer
     inv.completed_at = utcnow()
-    run.steps = steps + [{"step": "decision", "status": "succeeded", "verdict": decision.verdict}]
+    run.steps = steps + [{"step": "decision", "status": "succeeded",
+                          "classification": decision.classification, "verdict": decision.verdict}]
     run.status, run.completed_at = "completed", utcnow()
     db.add(Decision(tenant_id=tenant.id, investigation_id=inv.id, verdict=decision.verdict,
+                    classification=decision.classification, confidence=decision.confidence,
                     priority=decision.priority, summary=decision.summary, rationale=decision.rationale,
-                    evidence_ids=decision.evidence_ids, missing_data=decision.missing_data,
+                    evidence_ids=decision.evidence_ids,
+                    evidence_for=[claim.model_dump() for claim in decision.evidence_for],
+                    evidence_against=[claim.model_dump() for claim in decision.evidence_against],
+                    missing_data=decision.missing_data,
                     recommended_actions=decision.recommended_actions, actor=analyzer))
-    audit(db, tenant.id, analyzer, "decision", "investigation", inv.id, {"verdict": decision.verdict, "playbook": playbook.key})
+    move_alert(db, alert, PipelineState.TRIAGED, "worker", "decision_persisted")
+    audit(db, tenant.id, analyzer, "decision", "investigation", inv.id,
+          {"classification": decision.classification, "verdict": decision.verdict, "playbook": playbook.key})
     db.commit()
-    if decision.verdict == "false_positive" and decision.auto_close_eligible:
+    if decision.classification == "FP" and decision.auto_close_eligible:
         if settings().auto_close_enabled:
             action = perform_action(db, tenant, inv, alert, "close_alert", evidence)
             status = "auto_closed" if action and action.status == "succeeded" else "needs_review"
+            if not action:
+                audit(db, tenant.id, "policy", "auto_close_denied", "investigation", inv.id,
+                      {"reason": "close_gate_or_automation_level", "alert_id": alert.id})
         else:
             status = "needs_review"
             run.steps = [*run.steps, {"step": "auto_close_gate", "status": "denied", "reason": "globally_disabled"}]
             audit(db, tenant.id, "policy", "auto_close_denied", "investigation", inv.id,
                   {"reason": "globally_disabled", "alert_id": alert.id})
-    elif decision.verdict == "true_positive":
+    elif decision.classification == "TP":
         action = perform_action(db, tenant, inv, alert, "create_case", evidence)
         status = "escalated" if action and action.status == "succeeded" else "needs_review"
     else:
-        status = "needs_review" if decision.verdict == "needs_review" else "completed"
+        status = "needs_review"
+    target_state = {"auto_closed": PipelineState.CLOSED_FP,
+                    "escalated": PipelineState.CASE_CREATED}.get(status, PipelineState.NEEDS_REVIEW)
+    if target_state == PipelineState.CASE_CREATED and alert.pipeline_state == PipelineState.TRIAGED:
+        move_alert(db, alert, PipelineState.CASE_PENDING, "worker", "case_already_confirmed")
+    if target_state == PipelineState.CLOSED_FP and alert.pipeline_state == PipelineState.TRIAGED:
+        move_alert(db, alert, PipelineState.CLOSE_PENDING, "worker", "close_already_confirmed")
+    move_alert(db, alert, target_state, "worker", "processing_finished")
     inv.status = status
     alert.status = status
     alert.processed_at = utcnow()

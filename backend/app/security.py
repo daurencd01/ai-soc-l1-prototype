@@ -12,6 +12,7 @@ from .db import get_db
 from .models import Audit, User, utcnow
 
 bearer = HTTPBearer(auto_error=False)
+ROLES = frozenset({"viewer", "analyst", "admin", "policy_approver"})
 
 
 def hash_password(password: str) -> str:
@@ -45,7 +46,7 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bear
     except jwt.PyJWTError:
         raise HTTPException(401, "Недействительный токен")
     user = db.scalar(select(User).where(User.id == claims.get("sub"), User.tenant_id == claims.get("tenant_id"), User.active.is_(True)))
-    if not user or user.role != claims.get("role"):
+    if not user or user.role != claims.get("role") or user.role not in ROLES:
         raise HTTPException(401, "Пользователь недоступен")
     return user
 
@@ -53,6 +54,24 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bear
 def admin(user: User = Depends(current_user)) -> User:
     if user.role != "admin":
         raise HTTPException(403, "Требуется роль admin")
+    return user
+
+
+def analyst(user: User = Depends(current_user)) -> User:
+    if user.role not in {"analyst", "admin"}:
+        raise HTTPException(403, "Требуется роль analyst или admin")
+    return user
+
+
+def policy_approver(user: User = Depends(current_user)) -> User:
+    if user.role != "policy_approver":
+        raise HTTPException(403, "Требуется роль policy_approver")
+    return user
+
+
+def policy_revoker(user: User = Depends(current_user)) -> User:
+    if user.role not in {"policy_approver", "admin"}:
+        raise HTTPException(403, "Требуется роль policy_approver или admin")
     return user
 
 

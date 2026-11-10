@@ -11,6 +11,8 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
+from .classification import Classification, LegacyVerdict, action_lane, classification_for_lane
+
 
 def _event(kind: str, minutes: int = 0, **data: object) -> dict:
     return {"kind": kind, "minutes": minutes, "data": data}
@@ -22,7 +24,7 @@ def _scenario(
     rule: str,
     raw: dict,
     events: list[dict],
-    expected_verdict: str,
+    expected_verdict: LegacyVerdict,
     expected_action: str,
     *,
     severity: str = "medium",
@@ -32,7 +34,11 @@ def _scenario(
     event_age_minutes: int = 0,
     seed_maintenance: dict | None = None,
     seed_exception: dict | None = None,
+    expected_classification: Classification | None = None,
 ) -> dict:
+    classification = expected_classification or classification_for_lane(expected_verdict)
+    if action_lane(classification) != expected_verdict:
+        raise ValueError("Категория сценария не соответствует маршруту действий")
     return {
         "title": title,
         "description": description,
@@ -40,6 +46,7 @@ def _scenario(
         "raw": raw,
         "events": events,
         "expected_verdict": expected_verdict,
+        "expected_classification": classification,
         "expected_action": expected_action,
         "severity": severity,
         "checks": checks or [],
@@ -62,8 +69,10 @@ SCENARIOS: dict[str, dict] = {
          "asset_criticality": "medium"},
         [_event("ssh_login_success", user="root", host="demo-web-01", src_ip="10.10.1.15", method="publickey"),
          _event("process_start", 2, host="demo-web-01", command="systemctl status nginx", approved_task=True)],
-        "false_positive", "auto_close",
-        checks=["Сверить источник, хост и время с согласованной работой.", "Закрытие разрешено только при полном совпадении."],
+        "needs_review", "manual_review",
+        expected_classification="BENIGN_TRUE_POSITIVE",
+        checks=["Сверить источник, хост и время с согласованной работой.",
+                "Событие произошло; это BENIGN_TRUE_POSITIVE, а не ложный детект. Внешнего закрытия нет."],
         seed_maintenance={"entity": "demo-web-01", "reason": "Согласованное администрирование root",
                           "valid_from_offset_minutes": -60, "valid_until_offset_minutes": 60,
                           "approved_by": "demo_admin"},
@@ -91,6 +100,20 @@ SCENARIOS: dict[str, dict] = {
          "maintenance_approved": None, "post_activity": None, "asset_criticality": "unknown"},
         [_event("ssh_login_success", user="root", src_ip="198.51.100.23", host="demo-app-03")],
         "needs_review", "manual_review",
+    ),
+    "root_parser_false_positive": _scenario(
+        "Root SSH — ложный детект успеха",
+        "Алерт сообщает об успешном входе, но повторный поиск исходного события Splunk с тем же event_id подтверждает отказ.",
+        "root_ssh",
+        {"host": "demo-parser-error-01", "src_ip": "10.10.1.44", "user": "root",
+         "auth_method": "publickey", "success": True, "detector_event_id": "demo-auth-parser-01",
+         "prior_failures": 0, "post_activity": [], "asset_criticality": "low"},
+        [_event("ssh_login_failure", event_id="demo-auth-parser-01", result="denied",
+                user="root", host="demo-parser-error-01", src_ip="10.10.1.44",
+                auth_method="publickey")],
+        "false_positive", "manual_review", severity="low",
+        checks=["FP подтверждается отдельным поиском Splunk по исходному event_id.",
+                "Без утверждённой политики и включённого глобального флага закрытие запрещено."],
     ),
     "root_expired_exception": _scenario(
         "Root SSH — исключение истекло",
@@ -130,7 +153,8 @@ SCENARIOS: dict[str, dict] = {
          "configuration_approved": True},
         [_event("ipsec_ike_established", peer="192.0.2.10", tunnel="demo-s2s-primary"),
          _event("ipsec_child_sa_established", 1, peer="192.0.2.10", tunnel="demo-s2s-primary")],
-        "false_positive", "auto_close",
+        "needs_review", "manual_review",
+        expected_classification="BENIGN_TRUE_POSITIVE",
         checks=["Не идентифицировать пользователя по IP в поле user."],
     ),
     "vpn_handshake_only": _scenario(
@@ -162,7 +186,8 @@ SCENARIOS: dict[str, dict] = {
          "later_success": False, "maintenance_approved": True, "maintenance_active": True,
          "failure_reason": "proposal_mismatch"},
         [_event("ipsec_ike_failed", -3, peer="192.0.2.11", reason="proposal_mismatch", count=4)],
-        "false_positive", "auto_close",
+        "needs_review", "manual_review",
+        expected_classification="NOISE",
         seed_maintenance={"entity": "192.0.2.11", "reason": "Согласованная проверка настройки IPsec",
                           "valid_from_offset_minutes": -60, "valid_until_offset_minutes": 60,
                           "approved_by": "demo_admin"},
@@ -238,7 +263,8 @@ SCENARIOS: dict[str, dict] = {
          "source_allowed": True},
         [_event("login_failure", -8, user="demo.test", src_ip="10.30.5.8", count=25),
          _event("login_success", user="demo.test", src_ip="10.30.5.8")],
-        "false_positive", "auto_close",
+        "needs_review", "manual_review",
+        expected_classification="BENIGN_TRUE_POSITIVE",
         seed_maintenance={"entity": "demo.test", "reason": "Согласованный тест аутентификации",
                           "valid_from_offset_minutes": -60, "valid_until_offset_minutes": 60,
                           "approved_by": "demo_admin"},
@@ -266,7 +292,8 @@ SCENARIOS: dict[str, dict] = {
          "network_events": [], "admin_task": True,
          "maintenance_approved": True, "maintenance_active": True, "script_signed": True},
         [_event("process_start", parent="approved-agent.exe", child="powershell.exe", script_signed=True)],
-        "false_positive", "auto_close",
+        "needs_review", "manual_review",
+        expected_classification="BENIGN_TRUE_POSITIVE",
         seed_maintenance={"entity": "demo-ws-12", "reason": "Согласованная инвентаризация PowerShell",
                           "valid_from_offset_minutes": -60, "valid_until_offset_minutes": 60,
                           "approved_by": "demo_admin"},
@@ -291,15 +318,16 @@ SCENARIOS: dict[str, dict] = {
     ),
     "duplicate_delivery": _scenario(
         "Повторная доставка одного алерта",
-        "Два идентичных webhook-сообщения должны создать один алерт и не повторить внешнее действие.",
+        "Два идентичных webhook-сообщения должны создать один алерт без внешнего закрытия.",
         "root_ssh",
         {"src_ip": "10.10.1.15", "host": "demo-web-01", "user": "root", "auth_method": "publickey",
          "success": True, "connection_count": 1, "prior_failures": 0,
          "post_activity": [], "maintenance_approved": True, "maintenance_active": True, "source_allowed": True},
         [_event("ssh_login_success", user="root", host="demo-web-01", src_ip="10.10.1.15")],
-        "false_positive", "one_auto_close",
+        "needs_review", "one_alert_no_close",
+        expected_classification="BENIGN_TRUE_POSITIVE",
         pair_type="duplicate",
-        checks=["Оба сообщения имеют один source_event_id.", "Одна запись действия и один результат."],
+        checks=["Оба сообщения имеют один source_event_id.", "Нет повторного внешнего действия."],
         seed_maintenance={"entity": "demo-web-01", "reason": "Согласованное администрирование root",
                           "valid_from_offset_minutes": -60, "valid_until_offset_minutes": 60,
                           "approved_by": "demo_admin"},
@@ -468,6 +496,7 @@ def get_scenarios() -> list[dict]:
             "description": spec["description"],
             "rule": spec["rule"],
             "expected_verdict": spec["expected_verdict"],
+            "expected_classification": spec["expected_classification"],
             "expected_action": spec["expected_action"],
             "alert_count": 2 if spec["pair_type"] else 1,
             "checks": list(spec["checks"]),

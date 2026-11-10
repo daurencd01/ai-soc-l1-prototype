@@ -2,6 +2,8 @@
 
 Проект находится в стадии прототипа. Текущее состояние и открытые задачи описаны в [docs/PROGRESS.md](docs/PROGRESS.md); запуск и ограничения DEMO — в [README.md](README.md).
 
+Публичный репозиторий можно открыть по ссылке, создать fork и предложить изменения через pull request. Для прямой записи в основной репозиторий владелец должен пригласить участника по его GitHub username.
+
 1. Создайте отдельную ветку от `main` для изменения.
 2. Перед pull request выполните `.\.venv\Scripts\python.exe -m pytest -q` из `backend` и `npm run build` из `frontend`.
 3. В описании pull request укажите, что проверено локально, а что требует реальных Splunk, TheHive, MISP, Ollama или Docker.

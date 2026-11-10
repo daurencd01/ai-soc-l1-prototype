@@ -6,7 +6,7 @@ from sqlalchemy.pool import StaticPool
 from app.adapters import AdapterError, RealTheHive
 from app.db import Base, get_db
 import app.main as main_module
-from app.models import Action, Alert, Case, Tenant, User
+from app.models import Action, Case, Tenant, User
 from app.scenarios import instantiate_scenario
 from app.security import hash_password, token_for
 from app.workflow import ingest, process_alert

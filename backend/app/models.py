@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from uuid import uuid4
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, Index
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, Index, text
 from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
 
@@ -44,6 +44,7 @@ class Alert(Base):
     title: Mapped[str] = mapped_column(String(300))
     severity: Mapped[str] = mapped_column(String(20), default="medium")
     status: Mapped[str] = mapped_column(String(30), default="queued")
+    pipeline_state: Mapped[str] = mapped_column(String(30), default="RECEIVED")
     event_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     original_timezone: Mapped[str] = mapped_column(String(80), default="UTC")
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -72,6 +73,8 @@ class Investigation(Base):
     correlation_key: Mapped[str] = mapped_column(String(256), index=True)
     status: Mapped[str] = mapped_column(String(30), default="queued")
     verdict: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    classification: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     priority: Mapped[str] = mapped_column(String(20), default="medium")
     playbook_key: Mapped[str] = mapped_column(String(100))
     playbook_version: Mapped[str] = mapped_column(String(30))
@@ -119,13 +122,32 @@ class Decision(Base):
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
     investigation_id: Mapped[str] = mapped_column(ForeignKey("investigations.id"), index=True)
     verdict: Mapped[str] = mapped_column(String(30))
+    classification: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     priority: Mapped[str] = mapped_column(String(20))
     summary: Mapped[str] = mapped_column(Text)
     rationale: Mapped[str] = mapped_column(Text)
     evidence_ids: Mapped[list] = mapped_column(JSON, default=list)
+    evidence_for: Mapped[list] = mapped_column(JSON, default=list)
+    evidence_against: Mapped[list] = mapped_column(JSON, default=list)
     missing_data: Mapped[list] = mapped_column(JSON, default=list)
     recommended_actions: Mapped[list] = mapped_column(JSON, default=list)
     actor: Mapped[str] = mapped_column(String(100))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class PipelineTransition(Base):
+    """Append-only history for one alert's validated processing stages."""
+    __tablename__ = "pipeline_transitions"
+    __table_args__ = (Index("ix_pipeline_transition_alert_time", "tenant_id", "alert_id", "created_at"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    alert_id: Mapped[str] = mapped_column(ForeignKey("alerts.id"), index=True)
+    investigation_id: Mapped[str] = mapped_column(ForeignKey("investigations.id"), index=True)
+    from_state: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    to_state: Mapped[str] = mapped_column(String(30))
+    actor: Mapped[str] = mapped_column(String(100))
+    reason: Mapped[str] = mapped_column(String(200), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -182,15 +204,46 @@ class CaseWrite(Base):
 
 class ExceptionRule(Base):
     __tablename__ = "exceptions"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "policy_key", "version", name="uq_exceptions_tenant_policy_version"),
+        Index("uq_exceptions_one_approved_version", "tenant_id", "policy_key", unique=True,
+              sqlite_where=text("approval_status = 'approved'"),
+              postgresql_where=text("approval_status = 'approved'")),
+    )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    policy_key: Mapped[str] = mapped_column(String(36), default=uid)
+    version: Mapped[int] = mapped_column(Integer, default=1)
     rule: Mapped[str] = mapped_column(String(100))
     entity: Mapped[str] = mapped_column(String(256))
+    owner: Mapped[str] = mapped_column(String(100), default="")
+    created_by: Mapped[str] = mapped_column(String(100), default="")
     reason: Mapped[str] = mapped_column(Text)
     scope: Mapped[dict] = mapped_column(JSON, default=dict)
     valid_from: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     valid_until: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    approved_by: Mapped[str] = mapped_column(String(100))
+    approval_status: Mapped[str] = mapped_column(String(20), default="draft")
+    approved_by: Mapped[str] = mapped_column(String(100), default="")
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    change_reason: Mapped[str] = mapped_column(Text, default="")
+    revocation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class PolicyEvent(Base):
+    """Append-only API history for one FP policy version."""
+    __tablename__ = "policy_events"
+    __table_args__ = (Index("ix_policy_events_tenant_policy_time", "tenant_id", "policy_id", "created_at"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    policy_id: Mapped[str] = mapped_column(ForeignKey("exceptions.id"), index=True)
+    actor: Mapped[str] = mapped_column(String(100))
+    event_type: Mapped[str] = mapped_column(String(30))
+    from_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    to_status: Mapped[str] = mapped_column(String(20))
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

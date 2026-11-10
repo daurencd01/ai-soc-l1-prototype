@@ -6,6 +6,7 @@ from .config import settings
 from .db import SessionLocal
 from .models import (Alert, Checkpoint, DeadLetter, IntegrationState, Investigation, MispNotice, PlaybookRun, Tenant, utcnow)
 from .security import audit
+from .state import PipelineState, move_alert
 from .workflow import _integration, aware, ingest, process_alert
 
 celery_app = Celery("soc", broker=settings().redis_url, backend=settings().redis_url)
@@ -45,6 +46,10 @@ def process_alert_task(self, alert_id: str) -> None:
             if self.request.retries < self.max_retries:
                 alert = db.get(Alert, alert_id)
                 if alert:
+                    if alert.pipeline_state not in {PipelineState.CASE_CREATED, PipelineState.CLOSED_FP,
+                                                    PipelineState.SUPPRESSED, PipelineState.FAILED_PERMANENT}:
+                        move_alert(db, alert, PipelineState.FAILED_RETRYABLE, "worker",
+                                   "processing_exception")
                     alert.status = "queued"
                     alert.claimed_at = None
                     inv = db.get(Investigation, alert.investigation_id)
@@ -61,6 +66,12 @@ def process_alert_task(self, alert_id: str) -> None:
                 raise self.retry(exc=exc, countdown=min(10 * (2 ** self.request.retries), 60))
             alert = db.scalar(select(Alert).where(Alert.id == alert_id))
             if alert:
+                if alert.pipeline_state not in {PipelineState.CASE_CREATED, PipelineState.CLOSED_FP,
+                                                PipelineState.SUPPRESSED, PipelineState.FAILED_PERMANENT}:
+                    move_alert(db, alert, PipelineState.FAILED_RETRYABLE, "worker",
+                               "retry_budget_exhausted")
+                    move_alert(db, alert, PipelineState.FAILED_PERMANENT, "worker",
+                               "dead_letter_created")
                 alert.status = "failed"
                 existing = db.scalar(select(DeadLetter).where(DeadLetter.tenant_id == alert.tenant_id,
                     DeadLetter.alert_id == alert.id, DeadLetter.status == "open"))
@@ -84,6 +95,9 @@ def recover() -> int:
         for alert in alerts:
             if alert.status != "running":
                 continue
+            if alert.pipeline_state not in {PipelineState.CASE_CREATED, PipelineState.CLOSED_FP,
+                                            PipelineState.SUPPRESSED, PipelineState.FAILED_PERMANENT}:
+                move_alert(db, alert, PipelineState.FAILED_RETRYABLE, "worker", "stale_claim_recovered")
             alert.status = "queued"
             alert.claimed_at = None
             inv = db.get(Investigation, alert.investigation_id)

@@ -46,6 +46,21 @@ def test_root_summary_cannot_invent_attack_or_success():
                                 src_ip="192.0.2.1", count=30)], True).verdict == "needs_review"
 
 
+def test_root_false_positive_requires_matching_authoritative_denial():
+    raw = root_alert(success=True, detector_event_id="auth-17")
+    denial = {"id": "splunk:auth-17", "kind": "related_event", "source": "splunk",
+              "data": {"kind": "ssh_login_failure", "event_id": "auth-17", "result": "denied",
+                       "user": "root", "host": "host-a", "src_ip": "192.0.2.1",
+                       "auth_method": "publickey", "_time": BASE.isoformat()}}
+    decision = root_ssh(raw, [denial], True)
+    assert decision.classification == "FP" and decision.auto_close_eligible
+    assert [claim.evidence_id for claim in decision.evidence_against] == ["splunk:auth-17"]
+    assert root_ssh(raw, [{**denial, "source": "demo_splunk"}], True).classification == "INCONCLUSIVE"
+    assert root_ssh(raw, [{**denial, "data": {**denial["data"], "event_id": "other"}}], True).classification == "INCONCLUSIVE"
+    assert root_ssh(raw, [denial], False).classification == "INCONCLUSIVE"
+    assert root_ssh(raw, [denial, root_success(event_id="auth-17")], True).classification != "FP"
+
+
 @pytest.mark.parametrize("failure", [
     event("ssh_login_failure", -2, user="other", src_ip="192.0.2.1", count=30),
     event("ssh_login_failure", -2, user="root", src_ip="192.0.2.99", count=30),
@@ -56,12 +71,14 @@ def test_root_failures_must_match_identity_source_and_order(failure):
     assert decision.verdict == "needs_review"
 
 
-def test_root_matching_events_override_benign_summary_and_scope_controls_close():
+def test_root_matching_events_override_benign_summary_and_scope_controls_classification():
     failures = event("ssh_login_failure", -2, user="root", src_ip="192.0.2.1", count=18)
     matching = approval(host="host-a", src_ip="192.0.2.1", auth_method="publickey")
     assert root_ssh(root_alert(), [failures, root_success(), matching], True).verdict == "true_positive"
     allowed = root_ssh(root_alert(), [root_success(), matching], True)
-    assert allowed.verdict == "false_positive" and allowed.auto_close_eligible
+    assert allowed.classification == "BENIGN_TRUE_POSITIVE"
+    assert allowed.verdict == "needs_review" and not allowed.auto_close_eligible
+    assert {claim.evidence_id for claim in allowed.evidence_for} == {"ssh_login_success:0", "policy"}
     other_source = approval(host="host-a", src_ip="192.0.2.99", auth_method="publickey")
     assert root_ssh(root_alert(), [root_success(), other_source], True).verdict == "needs_review"
 
@@ -99,12 +116,14 @@ def test_brute_correlation_requires_same_user_recent_prior_failures_and_success_
     assert brute_force(brute_alert(), [failure, brute_success()], True).verdict == "needs_review"
 
 
-def test_brute_uses_event_counts_and_requires_policy_scope_for_test_closure():
+def test_brute_uses_event_counts_and_requires_policy_scope_for_benign_classification():
     matched = event("login_failure", -3, user="analyst", src_ip="192.0.2.2", count=30)
     policy = approval(user="analyst", src_ip="192.0.2.2")
     raw = brute_alert(failure_count=0, approved_test=True)
     allowed = brute_force(raw, [matched, brute_success(), policy], True)
-    assert allowed.verdict == "false_positive" and allowed.auto_close_eligible
+    assert allowed.classification == "BENIGN_TRUE_POSITIVE"
+    assert allowed.verdict == "needs_review" and not allowed.auto_close_eligible
+    assert {claim.evidence_id for claim in allowed.evidence_for} == {"login_failure:-3", "login_success:0", "policy"}
     wrong_scope = approval(user="analyst", src_ip="192.0.2.99")
     assert brute_force(raw, [matched, brute_success(), wrong_scope], True).verdict == "true_positive"
 

@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from app.db import Base
-from app.models import Action, Alert, Audit, Case, CaseWrite, Evidence, Investigation, Tenant
+from app.models import Action, Alert, Audit, Case, CaseWrite, Decision, Evidence, Investigation, Tenant
 from app.scenarios import instantiate_scenario
 from app.workflow import ingest, perform_action, process_alert
 import app.workflow as workflow
@@ -20,8 +20,10 @@ class HiveDouble:
         self.write_calls: list[str] = []
         self.read_calls: list[str] = []
 
-    def create_case(self, title, description, key):
+    def create_case(self, title, description, key, **metadata):
         self.create_calls += 1
+        assert metadata["severity"] in {1, 2, 3, 4}
+        assert metadata["tags"] and metadata["start_date"] <= metadata["end_date"]
         self.created[key] = "hive-case-1"
         if self.fail_kind == "create_case" and self.fail_mode == "ambiguous":
             self.fail_kind = None
@@ -94,8 +96,8 @@ def test_step_timeout_after_write_reconciles_without_duplicate(monkeypatch):
     engine, tenant_id, alert_id, inv_id = setup(monkeypatch, hive)
     action, case, writes = rows(engine, tenant_id)
     assert action.status == "unknown" and case.status == "enrichment_unknown"
-    assert [row.kind for row in writes] == ["create_case", "evidence_page", "task"]
-    assert [row.status for row in writes] == ["succeeded", "unknown", "pending"]
+    assert [row.kind for row in writes] == ["create_case", "evidence_page", "observable", "task"]
+    assert [row.status for row in writes] == ["succeeded", "unknown", "pending", "pending"]
     assert all(row.idempotency_key and row.request_data for row in writes)
     assert all(row.attempts == 1 for row in writes[:2]) and writes[2].attempts == 0
     with Session(engine) as db:
@@ -106,6 +108,7 @@ def test_step_timeout_after_write_reconciles_without_duplicate(monkeypatch):
     assert case.status == "open" and all(row.status == "succeeded" for row in writes)
     assert hive.create_calls == 1
     assert hive.write_calls.count("evidence_page") == 1
+    assert hive.write_calls.count("observable") == 1
     assert hive.write_calls.count("task") == 1
     assert hive.read_calls == ["evidence_page"]
     assert reconcile(engine, tenant_id, alert_id, inv_id) == "succeeded"
@@ -128,7 +131,7 @@ def test_definite_step_rejection_never_marks_overall_case_succeeded(monkeypatch)
     engine, tenant_id, alert_id, inv_id = setup(monkeypatch, hive)
     action, case, writes = rows(engine, tenant_id)
     assert action.status == "failed" and case.status == "enrichment_failed"
-    assert [row.status for row in writes] == ["succeeded", "succeeded", "failed"]
+    assert [row.status for row in writes] == ["succeeded", "succeeded", "succeeded", "failed"]
     assert reconcile(engine, tenant_id, alert_id, inv_id) == "failed"
     assert hive.write_calls.count("task") == 1
 
@@ -169,3 +172,30 @@ def test_observable_write_has_own_key_and_reconciles(monkeypatch):
     assert reconcile(engine, tenant_id, alert_id, inv_id) == "succeeded"
     assert hive.write_calls.count("observable") == 1
     assert hive.read_calls == ["observable"]
+
+
+def test_case_plan_uses_persisted_decision_claims(monkeypatch):
+    hive = HiveDouble()
+    engine = create_engine("sqlite+pysqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(workflow, "thehive_adapter", lambda: hive)
+    with Session(engine) as db:
+        tenant = Tenant(name="claims-test", deployment_mode="DEMO", automation_level="observe")
+        db.add(tenant)
+        db.commit()
+        alert, _ = ingest(db, tenant.id, instantiate_scenario("root_unapproved")[0])
+        process_alert(db, alert.id)
+        inv = db.get(Investigation, alert.investigation_id)
+        evidence = db.scalars(select(Evidence).where(Evidence.investigation_id == inv.id)).all()
+        raw_id = next(item.id for item in evidence if item.kind == "raw_alert")
+        decision = db.scalar(select(Decision).where(Decision.investigation_id == inv.id))
+        decision.evidence_for = [{"evidence_id": raw_id, "reason": "Исходный алерт"}]
+        tenant.automation_level = "controlled_automation"
+        db.commit()
+        action = perform_action(db, tenant, inv, alert, "create_case", evidence)
+        assert action and action.status == "succeeded"
+        case = db.scalar(select(Case).where(Case.investigation_id == inv.id))
+        assert case.data["evidence_for_ids"] == [raw_id]
+        create = db.scalar(select(CaseWrite).where(CaseWrite.case_id == case.id,
+            CaseWrite.kind == "create_case"))
+        assert f"[{raw_id}]" in create.request_data["description"]

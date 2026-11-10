@@ -10,12 +10,14 @@ const navigation: NavItem[] = [
   { path: '/scenarios', label: 'Сценарии DEMO', group: 'Работа' },
   { path: '/contexts', label: 'Исключения и работы', group: 'Контроль' },
   { path: '/assets', label: 'Инвентарь активов', group: 'Контроль' },
+  { path: '/metrics', label: 'Метрики', group: 'Контроль', admin: true },
   { path: '/integrations', label: 'Интеграции', group: 'Контроль' },
   { path: '/sla', label: 'Сроки обработки', group: 'Контроль' },
   { path: '/dead-letters', label: 'Ошибочные задачи', group: 'Контроль' },
   { path: '/shifts', label: 'Смены и отчёты', group: 'Учёт' },
   { path: '/audit', label: 'Аудит', group: 'Учёт' },
   { path: '/settings', label: 'Политика действий', group: 'Управление', admin: true },
+  { path: '/users', label: 'Пользователи', group: 'Управление', admin: true },
 ]
 
 function wallTimeToIso(value: string, timeZone: string): string {
@@ -40,25 +42,37 @@ function statusLabel(value: unknown): string {
     completed: 'Завершён', closed: 'Закрыт', auto_closed: 'Автозакрыт', escalated: 'Эскалирован', reported: 'Отчёт утверждён', retried: 'Повторена', failed: 'Ошибка', pending: 'Ожидает',
     succeeded: 'Выполнено', unknown: 'Неизвестно', healthy: 'Доступно', degraded: 'Сбой', unavailable: 'Недоступно', stale: 'Нет сигнала',
     true_positive: 'Подтверждено', false_positive: 'Ложное срабатывание', needs_review: 'Нужна проверка',
+    tp: 'Инцидент', fp: 'Ложное срабатывание', benign_true_positive: 'Разрешённая активность', noise: 'Шум', inconclusive: 'Недостаточно данных',
+    validated: 'Проверен', enriching: 'Сбор данных', triaging: 'Классификация', triaged: 'Классифицирован',
+    case_pending: 'Создание кейса', case_created: 'Кейс создан', suppressed: 'Подавлен', close_pending: 'Закрытие ожидается', closed_fp: 'FP закрыт',
+    failed_retryable: 'Повтор возможен', failed_permanent: 'Ошибка без повтора',
     critical: 'Критический', high: 'Высокий', medium: 'Средний', low: 'Низкий',
-    open: 'Открыт', resolved: 'Решён', active: 'Активно', context: 'Только контекст', expired: 'Истекло', approved: 'Утверждено', draft: 'Черновик',
+    open: 'Открыт', resolved: 'Решён', active: 'Активно', context: 'Только контекст', expired: 'Истекло', approved: 'Утверждено', draft: 'Черновик', superseded: 'Заменено', revoked: 'Отозвано', proposed: 'Предложено', version_proposed: 'Предложена версия',
     host: 'Хост', ip: 'IP-адрес', user: 'Пользователь', vpn_peer: 'VPN peer', device: 'Устройство',
     reviewed: 'Проверено', not_transferred: 'Не передано', pending_confirmation: 'Ожидает подтверждения', handoff_recorded: 'Подтверждение передачи записано',
-    observe: 'Наблюдение', auto_close: 'Автозакрытие', approved_response: 'Разрешённые действия', create_case: 'Создание кейса', evidence_page: 'Страница доказательств', observable: 'Наблюдаемый объект', task: 'Задача кейса', close_alert: 'Закрытие алерта', update_case: 'Смена статуса кейса', disable_account_demo: 'DEMO: блокировка учётной записи', isolate_host_demo: 'DEMO: изоляция хоста',
+    disabled: 'Отключено', observe: 'Наблюдение', recommend: 'Рекомендации', controlled_automation: 'Контролируемая автоматизация',
+    auto_close: 'Автозакрытие', approved_response: 'Разрешённые действия', create_case: 'Создание кейса', evidence_page: 'Страница доказательств', observable: 'Наблюдаемый объект', task: 'Задача кейса', close_alert: 'Закрытие алерта', update_case: 'Смена статуса кейса', disable_account_demo: 'DEMO: блокировка учётной записи', isolate_host_demo: 'DEMO: изолировать хост',
   }
   return labels[key] ?? valueText(value, 'Неизвестно')
 }
 
 function toneFor(value: unknown): string {
   const key = valueText(value, '').toLowerCase()
-  if (['critical', 'high', 'true_positive', 'failed', 'unavailable', 'stale', 'overdue', 'error', 'expired'].includes(key)) return 'danger'
-  if (['needs_review', 'medium', 'pending', 'degraded', 'unknown', 'processing', 'investigating', 'running', 'queued'].includes(key)) return 'warning'
-  if (['false_positive', 'completed', 'closed', 'resolved', 'auto_closed', 'succeeded', 'healthy', 'approved', 'active', 'reported'].includes(key)) return 'success'
+  if (['critical', 'high', 'true_positive', 'tp', 'failed', 'failed_permanent', 'unavailable', 'stale', 'overdue', 'error', 'expired'].includes(key)) return 'danger'
+  if (['needs_review', 'inconclusive', 'medium', 'pending', 'failed_retryable', 'degraded', 'unknown', 'processing', 'investigating', 'running', 'queued', 'draft'].includes(key)) return 'warning'
+  if (['false_positive', 'fp', 'completed', 'closed', 'resolved', 'auto_closed', 'closed_fp', 'succeeded', 'healthy', 'approved', 'active', 'reported'].includes(key)) return 'success'
   return 'neutral'
 }
 
 function Badge({ value, label }: { value: unknown; label?: string }) {
   return <span className={`badge badge--${toneFor(value)}`}>{label ?? statusLabel(value)}</span>
+}
+
+const classifications = ['TP', 'FP', 'BENIGN_TRUE_POSITIVE', 'NOISE', 'INCONCLUSIVE'] as const
+
+function confidenceText(value: unknown): string {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1
+    ? `${Math.round(value * 100)}% · оценка модели` : 'Не указана'
 }
 
 function integrationName(value: unknown): string {
@@ -190,7 +204,7 @@ function Shell({ user, onLogout, children }: { user: JsonRecord; onLogout: () =>
           return <div key={item.path}>{showGroup && <div className="nav-group">{item.group}</div>}<Link to={item.path} className={`nav-link ${active ? 'nav-link--active' : ''}`}>{item.label}</Link></div>
         })}
       </nav>
-      <div className="sidebar__footer"><div className="account"><span className="account__avatar">{valueText(first(user, 'username', 'name'), 'A').slice(0, 1).toUpperCase()}</span><div><strong>{valueText(first(user, 'display_name', 'username', 'name'), 'Пользователь')}</strong><small>{admin ? 'Администратор' : 'Аналитик'} · {valueText(first(user, 'tenant_name', 'tenant_id'), 'Заказчик не указан')}</small></div></div><button className="text-button" onClick={onLogout}>Выйти из системы</button></div>
+      <div className="sidebar__footer"><div className="account"><span className="account__avatar">{valueText(first(user, 'username', 'name'), 'A').slice(0, 1).toUpperCase()}</span><div><strong>{valueText(first(user, 'display_name', 'username', 'name'), 'Пользователь')}</strong><small>{admin ? 'Администратор' : role === 'policy_approver' ? 'Согласующий политик' : role === 'viewer' ? 'Наблюдатель' : 'Аналитик'} · {valueText(first(user, 'tenant_name', 'tenant_id'), 'Заказчик не указан')}</small></div></div><button className="text-button" onClick={onLogout}>Выйти из системы</button></div>
     </aside>
     <div className="main-wrap"><div className="topbar"><span>Sauyt.Lab / {navigation.find(item => item.path === path)?.label ?? (path.startsWith('/investigations/') ? 'Расследование' : 'Рабочая область')}</span><div className="topbar__right"><span className="topbar__mode">{mode === 'demo' ? 'ДЕМО ДАННЫЕ' : mode === 'connected' ? 'ПОДКЛЮЧЕНО' : 'СТАТУС НЕИЗВЕСТЕН'}</span><span>{new Intl.DateTimeFormat('ru-RU', { dateStyle: 'medium' }).format(new Date())}</span></div></div><main id="main" className="content">{children}</main></div>
   </div>
@@ -238,21 +252,42 @@ function Dashboard({ user }: { user: JsonRecord }) {
     {recent.error && <ErrorState message={recent.error} retry={recent.reload} />}
     {(overview.loading && !overview.data) || (recent.loading && !recent.data) ? <Loading /> : <>
       <div className="metric-grid">{metrics.map(metric => <div className="metric" key={metric.label}><div className="metric__label">{metric.label}</div><div className="metric__value">{valueText(metric.value)}</div><div className="metric__caption">{metric.value === undefined ? 'Данные недоступны' : metric.caption}</div></div>)}</div>
+      <Panel title="Классификации решений" aside={user.role === 'admin' ? <Link to="/metrics" className="inline-link">Все метрики</Link> : undefined}><div className="classification-summary">{classifications.map(key => <div key={key}><Badge value={key} /><strong>{valueText(asRecord(info.classification_counts)[key], '0')}</strong></div>)}</div><p className="field__hint">Подсчёт по сохранённым решениям, включая повторные решения одного расследования.</p></Panel>
       <div className="dashboard-grid"><Panel title="Недавние алерты" aside={<Link to="/alerts" className="inline-link">Вся очередь</Link>}>{alerts.length ? <div className="stack-list">{alerts.map((item, index) => <AlertRow key={valueText(item.id, String(index))} item={item} />)}</div> : <Empty title="Алертов пока нет" detail="Проверьте поступление логов и состояние интеграций. Пустая очередь сама по себе не подтверждает исправность мониторинга." />}</Panel>
         <div className="dashboard-side"><Panel title="Состояние источников" aside={<Link to="/integrations" className="inline-link">Интеграции</Link>}>{integrations.length ? <div className="health-list">{integrations.map((item, index) => <div className="health-row" key={valueText(item.name, String(index))}><div><strong>{integrationName(item.name)}</strong><small>{item.name === 'worker' ? 'Последний сигнал' : 'Последний лог'}: {dateText(item.name === 'worker' ? item.last_checked_at : item.last_received_at)}</small></div><Badge value={item.status} /></div>)}</div> : <Empty title="Состояние неизвестно" detail="Источники ещё не сообщили о доступности и времени последнего лога." />}</Panel><Panel title="Продолжить работу"><div className="quick-links"><Link to="/sla">Проверить сроки обработки <span>→</span></Link><Link to="/dead-letters">Разобрать ошибочные задачи <span>→</span></Link><Link to="/shifts">Подготовить передачу смены <span>→</span></Link></div></Panel></div></div>
     </>}</>
+}
+
+function Metrics() {
+  const { data, loading, error, reload } = useResource('/metrics', 30000)
+  const values = asRecord(data)
+  const triage = asRecord(values.triage_results_total)
+  const duration = asRecord(values.processing_duration_seconds)
+  const counters = [
+    ['Принято алертов', values.alert_ingestion_total], ['Повторных доставок', values.alert_deduplicated_total],
+    ['Создано кейсов', values.cases_created_total], ['Подавлено', values.cases_suppressed_total],
+    ['Попыток автозакрытия', values.auto_close_attempts_total], ['Отказов автозакрытия', values.auto_close_denied_total],
+    ['Ошибок интеграций', values.integration_errors_total], ['Глубина очереди', values.queue_depth],
+    ['Ошибочных задач', values.dead_letters_open],
+  ] as const
+  return <><PageHead title="Операционные метрики" description="Счётчики серверной обработки в пределах текущего заказчика." actions={<button className="button button--secondary" onClick={reload}>Обновить</button>} />{error && <ErrorState message={error} retry={reload} />}{loading && !data ? <Loading /> : <>
+    <div className="metric-grid">{counters.map(([label, value]) => <div className="metric" key={label}><div className="metric__label">{label}</div><div className="metric__value">{valueText(value, '—')}</div></div>)}</div>
+    <Panel title="Результаты классификации"><div className="classification-summary">{classifications.map(key => <div key={key}><Badge value={key} /><strong>{valueText(triage[key], '0')}</strong></div>)}</div><p className="field__hint">Подсчёт по решениям, а не по уникальным алертам.</p></Panel>
+    <Panel title="Время обработки"><Meta entries={[{ label: 'Завершённых расследований', value: valueText(duration.count, '0') }, { label: 'Среднее', value: typeof duration.avg === 'number' ? `${duration.avg.toFixed(1)} с` : 'Недостаточно данных' }, { label: 'Суммарное', value: typeof duration.sum === 'number' ? `${duration.sum.toFixed(1)} с` : 'Недостаточно данных' }]} /></Panel>
+  </>}</>
 }
 
 function AlertRow({ item }: { item: JsonRecord }) {
   const investigationId = first(item, 'investigation_id', 'investigationId')
   const id = valueText(first(item, 'id', 'alert_id', 'source_event_id', 'source_id'))
   const target = investigationId ? `/investigations/${encodeURIComponent(valueText(investigationId))}` : `/investigations/${encodeURIComponent(id)}`
-  return <Link to={target} className="alert-row"><span className={`severity-dot severity-dot--${toneFor(first(item, 'severity', 'priority'))}`} /><span className="alert-row__main"><strong>{valueText(first(item, 'title', 'rule', 'rule_name', 'name', 'event_type'), `Алерт ${id}`)}</strong><small>{valueText(first(item, 'customer_name', 'tenant_name', 'source'), 'Источник не указан')} · {dateText(first(item, 'received_at', 'created_at', 'event_at', 'event_time'))}</small></span><Badge value={first(item, 'status', 'processing_status')} /><span className="alert-row__arrow" aria-hidden="true">→</span></Link>
+  return <Link to={target} className="alert-row"><span className={`severity-dot severity-dot--${toneFor(first(item, 'severity', 'priority'))}`} /><span className="alert-row__main"><strong>{valueText(first(item, 'title', 'rule', 'rule_name', 'name', 'event_type'), `Алерт ${id}`)}</strong><small>{valueText(first(item, 'customer_name', 'tenant_name', 'source'), 'Источник не указан')} · {dateText(first(item, 'received_at', 'created_at', 'event_at', 'event_time'))}</small><small>{item.classification ? statusLabel(item.classification) : 'Классификация ожидается'} · {statusLabel(item.pipeline_state)}</small></span><Badge value={first(item, 'status', 'processing_status')} /><span className="alert-row__arrow" aria-hidden="true">→</span></Link>
 }
 
 function Alerts({ user }: { user: JsonRecord }) {
   const [status, setStatus] = useState('')
   const [verdict, setVerdict] = useState('')
+  const [classification, setClassification] = useState('')
   const [search, setSearch] = useState('')
   const [query, setQuery] = useState('')
   const [file, setFile] = useState<File | null>(null)
@@ -268,6 +303,7 @@ function Alerts({ user }: { user: JsonRecord }) {
     const params = new URLSearchParams()
     if (status) params.set('status', status)
     if (verdict) params.set('verdict', verdict)
+    if (classification) params.set('classification', classification)
     if (search.trim()) params.set('search', search.trim())
     setQuery(params.toString())
   }
@@ -285,12 +321,12 @@ function Alerts({ user }: { user: JsonRecord }) {
     if (ok) { setFile(null); setUploadKey(value => value + 1) }
   }
   return <><PageHead title="Алерты" description="Исходные алерты сохраняются отдельно от расследований и вложенных событий." actions={<button className="button button--secondary" onClick={reload}>Обновить</button>} />
-    <Panel className="filter-panel"><form className="filters" onSubmit={apply}><Field label="Поиск по названию"><input placeholder="Название алерта" value={search} onChange={event => setSearch(event.target.value)} /></Field><Field label="Статус"><select value={status} onChange={event => setStatus(event.target.value)}><option value="">Все статусы</option><option value="queued">В очереди</option><option value="running">В работе</option><option value="needs_review">Нужна проверка</option><option value="auto_closed">Автозакрыт</option><option value="escalated">Эскалирован</option><option value="failed">Ошибка</option></select></Field><Field label="Вердикт"><select value={verdict} onChange={event => setVerdict(event.target.value)}><option value="">Все вердикты</option><option value="true_positive">Подтверждено</option><option value="false_positive">Ложное срабатывание</option><option value="needs_review">Нужна проверка</option></select></Field><button className="button button--primary" type="submit">Применить</button></form></Panel>
+    <Panel className="filter-panel"><form className="filters" onSubmit={apply}><Field label="Поиск по названию"><input placeholder="Название алерта" value={search} onChange={event => setSearch(event.target.value)} /></Field><Field label="Статус"><select value={status} onChange={event => setStatus(event.target.value)}><option value="">Все статусы</option><option value="queued">В очереди</option><option value="running">В работе</option><option value="needs_review">Нужна проверка</option><option value="auto_closed">Автозакрыт</option><option value="escalated">Эскалирован</option><option value="failed">Ошибка</option></select></Field><Field label="Классификация"><select value={classification} onChange={event => setClassification(event.target.value)}><option value="">Все классификации</option>{classifications.map(key => <option key={key} value={key}>{statusLabel(key)}</option>)}</select></Field><Field label="Маршрут действий"><select value={verdict} onChange={event => setVerdict(event.target.value)}><option value="">Все маршруты</option><option value="true_positive">Инцидент</option><option value="false_positive">FP</option><option value="needs_review">Ручная проверка</option></select></Field><button className="button button--primary" type="submit">Применить</button></form></Panel>
     {admin && <Panel title="Импорт алертов"><form className="import-form" onSubmit={submitImport}><Field label="JSON или CSV, не более 2 МБ"><input key={uploadKey} type="file" accept=".json,.csv,application/json,text/csv" required onChange={event => setFile(event.target.files?.[0] ?? null)} /></Field><button className="button button--secondary" disabled={!file || upload.busy}>{upload.busy ? 'Импорт…' : 'Импортировать'}</button></form><Notice flash={upload.flash} />{uploadResult && <p className="panel-intro">Новых алертов: {valueText(uploadResult.created_count)}.</p>}</Panel>}
-    {error && <ErrorState message={error} retry={reload} />}{loading && !data ? <Loading /> : <Panel title="Список алертов" aside={<span className="quiet">{list.length} записей</span>}>{list.length ? <div className="table-wrap"><table><thead><tr><th>Алерт</th><th>Заказчик / источник</th><th>Критичность</th><th>Поступил</th><th>Обработка</th><th>Вердикт</th><th></th></tr></thead><tbody>{list.map((item, index) => {
+    {error && <ErrorState message={error} retry={reload} />}{loading && !data ? <Loading /> : <Panel title="Список алертов" aside={<span className="quiet">{list.length} записей</span>}>{list.length ? <div className="table-wrap"><table><thead><tr><th>Алерт</th><th>Заказчик / источник</th><th>Критичность</th><th>Поступил</th><th>Состояние конвейера</th><th>Обработка</th><th>Классификация</th><th>Уверенность</th><th></th></tr></thead><tbody>{list.map((item, index) => {
       const id = valueText(item.id, String(index))
       const investigationId = valueText(item.investigation_id, '')
-      return <tr key={id}><td><strong>{valueText(item.title, 'Без названия')}</strong><small className="cell-sub">{valueText(item.source_event_id)}</small></td><td>{valueText(user.tenant_name)}<small className="cell-sub">{valueText(item.source)}</small></td><td><Badge value={item.severity} /></td><td className="number">{dateText(item.received_at)}</td><td><Badge value={item.status} /></td><td><Badge value={item.verdict} /></td><td>{investigationId && <Link className="inline-link" to={`/investigations/${encodeURIComponent(investigationId)}`}>Открыть</Link>}</td></tr>
+      return <tr key={id}><td><strong>{valueText(item.title, 'Без названия')}</strong><small className="cell-sub">{valueText(item.source_event_id)}</small></td><td>{valueText(user.tenant_name)}<small className="cell-sub">{valueText(item.source)}</small></td><td><Badge value={item.severity} /></td><td className="number">{dateText(item.received_at)}</td><td><Badge value={item.pipeline_state} /></td><td><Badge value={item.status} /></td><td>{item.classification ? <Badge value={item.classification} /> : '—'}</td><td>{confidenceText(item.confidence)}</td><td>{investigationId && <Link className="inline-link" to={`/investigations/${encodeURIComponent(investigationId)}`}>Открыть</Link>}</td></tr>
     })}</tbody></table></div> : <Empty title="По этому фильтру алертов нет" detail="Измените условия поиска или проверьте приём событий в разделе интеграций." />}</Panel>}</>
 }
 
@@ -336,11 +372,31 @@ function CaseStatusControl({ caseId, currentStatus, onUpdated }: { caseId: strin
   </form>
 }
 
+function EvidenceClaims({ title, claims }: { title: string; claims: JsonRecord[] }) {
+  return <div className="claim-group"><h3>{title}</h3>{claims.length ? <ul>{claims.map((claim, index) => <li key={`${valueText(claim.evidence_id, String(index))}-${index}`}><strong>ID {valueText(claim.evidence_id)}</strong><span>{valueText(claim.reason, 'Основание не указано')}</span></li>)}</ul> : <p>Не указаны</p>}</div>
+}
+
+function transitionReasonLabel(value: unknown): string {
+  const reason = valueText(value, '')
+  const labels: Record<string, string> = {
+    alert_received: 'Алерт принят', payload_validated: 'Формат проверен', evidence_collection_started: 'Начат сбор доказательств',
+    triage_started: 'Начата классификация', decision_persisted: 'Решение сохранено', processing_finished: 'Обработка завершена',
+    authorized_external_action: 'Внешнее действие разрешено политикой', manual_review: 'Проверка аналитика',
+    processing_exception: 'Ошибка обработки', retry_budget_exhausted: 'Попытки исчерпаны', dead_letter_created: 'Запись в очередь ошибок',
+    stale_claim_recovered: 'Зависшая задача восстановлена', stale_claim_retried: 'Зависшая задача отправлена повторно',
+    manual_dead_letter_retry: 'Ручной повтор ошибочной задачи', case_already_confirmed: 'Кейс уже подтверждён',
+    close_already_confirmed: 'Закрытие уже подтверждено', close_outcome_unknown: 'Результат закрытия неизвестен',
+  }
+  if (reason.startsWith('case_write_')) return `Запись кейса: ${statusLabel(reason.slice('case_write_'.length))}`
+  if (reason.startsWith('close_')) return `Закрытие алерта: ${statusLabel(reason.slice('close_'.length))}`
+  return labels[reason] ?? reason
+}
+
 function Investigation({ id, user }: { id: string; user: JsonRecord }) {
   const { data, loading, error, reload } = useResource(`/investigations/${encodeURIComponent(id)}`)
   const policy = useResource('/settings')
   const [tab, setTab] = useState('evidence')
-  const [verdict, setVerdict] = useState('needs_review')
+  const [classification, setClassification] = useState('INCONCLUSIVE')
   const [note, setNote] = useState('')
   const [actionBusy, setActionBusy] = useState('')
   const [actionFlash, setActionFlash] = useState<Flash>(null)
@@ -356,16 +412,19 @@ function Investigation({ id, user }: { id: string; user: JsonRecord }) {
   const decisions = records(inv.decisions)
   const decision = decisions[decisions.length - 1] ?? {}
   const admin = valueText(user.role).toLowerCase() === 'admin'
+  const canReview = admin || user.role === 'analyst'
   const settings = asRecord(policy.data)
   const mode = valueText(user.mode, '').toLowerCase()
-  const canAct = admin && settings.automation_level !== 'observe' && (mode === 'demo' || settings.connected_writes_enabled === true)
+  const canAct = admin && ['controlled_automation', 'approved_response'].includes(valueText(settings.automation_level)) && (mode === 'demo' || settings.connected_writes_enabled === true)
+  const transitions = records(inv.transitions)
   const timeline: JsonRecord[] = [...evidence.map(item => ({ ...item, timeline_kind: 'Доказательство', timeline_at: item.collected_at ?? item.event_at })),
     ...actions.map(item => ({ ...item, timeline_kind: 'Действие', timeline_at: item.completed_at ?? item.attempted_at })),
-    ...caseWrites.map(item => ({ ...item, timeline_kind: 'Запись TheHive', timeline_at: item.completed_at ?? item.attempted_at, summary: statusLabel(item.kind) }))]
-    .sort((a, b) => new Date(valueText(a.timeline_at, '1970-01-01')).getTime() - new Date(valueText(b.timeline_at, '1970-01-01')).getTime())
+    ...caseWrites.map(item => ({ ...item, timeline_kind: 'Запись TheHive', timeline_at: item.completed_at ?? item.attempted_at, summary: statusLabel(item.kind) })),
+    ...transitions.map(item => ({ ...item, timeline_kind: 'Конвейер', timeline_at: item.created_at, summary: `${item.from_state ? statusLabel(item.from_state) : 'Начало'} → ${statusLabel(item.to_state)}`, timeline_detail: `${transitionReasonLabel(item.reason)} · ${valueText(item.actor, 'Система')}` }))]
+    .sort((a, b) => (dateValue(a.timeline_at) ?? 0) - (dateValue(b.timeline_at) ?? 0))
   const reviewed = async (event: FormEvent) => {
     event.preventDefault()
-    const ok = await mutation.run(() => api(`/investigations/${encodeURIComponent(id)}/review`, { method: 'POST', body: body({ verdict, note }) }), 'Вердикт аналитика сохранён.', reload)
+    const ok = await mutation.run(() => api(`/investigations/${encodeURIComponent(id)}/review`, { method: 'POST', body: body({ classification, note }) }), 'Классификация аналитика сохранена.', reload)
     if (ok) setNote('')
   }
   const perform = async (kind: string) => {
@@ -395,30 +454,33 @@ function Investigation({ id, user }: { id: string; user: JsonRecord }) {
   return <><div className="backline"><Link to="/alerts">← К списку алертов</Link></div>
     <PageHead title={valueText(alert.title, valueText(inv.summary, `Расследование ${id}`))} description={`Расследование ${id} · ${valueText(alert.source_event_id, 'Идентификатор источника не указан')}`} actions={<button className="button button--secondary" onClick={reload}>Обновить</button>} />
     {error && <ErrorState message={error} retry={reload} />}{loading && !data ? <Loading /> : <>
-      <div className="detail-top"><Panel title="Состояние"><div className="status-pair"><div><span>Обработка</span><Badge value={inv.status} /></div><div><span>Вердикт</span><Badge value={inv.verdict} /></div></div><Meta entries={[
+      <div className="detail-top"><Panel title="Состояние"><div className="status-pair"><div><span>Обработка</span><Badge value={inv.status} /></div><div><span>Классификация</span>{inv.classification ? <Badge value={inv.classification} /> : '—'}</div></div><Meta entries={[
         { label: 'Заказчик', value: valueText(user.tenant_name) }, { label: 'Критичность', value: <Badge value={inv.priority} /> },
         { label: 'Время события', value: dateText(alert.event_at) }, { label: 'Поступил', value: dateText(alert.received_at) },
         { label: 'Срок обработки', value: dateText(inv.due_at) }, { label: 'Правило', value: valueText(alert.rule) },
+        { label: 'Конвейер', value: <Badge value={alert.pipeline_state} /> }, { label: 'Маршрут действий', value: <Badge value={inv.verdict} /> },
       ]} /></Panel><Panel title="Текущее решение"><p className="decision-summary">{valueText(inv.summary, 'Решение ещё не сформировано.')}</p><p className="panel-intro">{valueText(inv.rationale, 'Обоснование пока не записано.')}</p><Meta entries={[
         { label: 'Приоритет', value: <Badge value={inv.priority} /> },
         { label: 'Анализатор', value: valueText(inv.analyzer) },
+        { label: 'Уверенность', value: confidenceText(inv.confidence) },
         { label: 'Доказательства решения', value: Array.isArray(decision.evidence_ids) ? decision.evidence_ids.map(value => valueText(value)).join(', ') || 'Не указаны' : 'Не указаны' },
         { label: 'Недостающие данные', value: Array.isArray(inv.missing_data) ? inv.missing_data.map(value => valueText(value)).join(', ') || 'Не указаны' : 'Не указаны' },
         { label: 'Рекомендуемые действия', value: Array.isArray(inv.recommended_actions) ? inv.recommended_actions.map(value => valueText(value)).join(', ') || 'Не указаны' : 'Не указаны' },
         { label: 'Последнее решение', value: dateText(decision.created_at) },
-      ]} /></Panel></div>
+      ]} /><div className="claim-grid"><EvidenceClaims title="Подтверждающие факты" claims={records(decision.evidence_for)} /><EvidenceClaims title="Противоречащие факты" claims={records(decision.evidence_against)} /></div></Panel></div>
       <div className="detail-layout"><div>
-        <div className="tabs" role="tablist" aria-label="Разделы расследования">{[['evidence', 'Доказательства'], ['timeline', 'Временная шкала'], ['playbook', 'Плейбук'], ['actions', 'Действия и кейсы']].map(([key, label]) => <button key={key} type="button" role="tab" aria-selected={tab === key} className={tab === key ? 'tab tab--active' : 'tab'} onClick={() => setTab(key)}>{label}<span>{key === 'evidence' ? evidence.length : key === 'timeline' ? timeline.length : key === 'playbook' ? playbooks.length : actions.length + cases.length + caseWrites.length}</span></button>)}</div>
+        <div className="tabs" role="tablist" aria-label="Разделы расследования">{[['evidence', 'Доказательства'], ['decisions', 'Решения'], ['timeline', 'Временная шкала'], ['playbook', 'Плейбук'], ['actions', 'Действия и кейсы']].map(([key, label]) => <button key={key} type="button" role="tab" aria-selected={tab === key} className={tab === key ? 'tab tab--active' : 'tab'} onClick={() => setTab(key)}>{label}<span>{key === 'evidence' ? evidence.length : key === 'decisions' ? decisions.length : key === 'timeline' ? timeline.length : key === 'playbook' ? playbooks.length : actions.length + cases.length + caseWrites.length}</span></button>)}</div>
         {tab === 'evidence' && <Panel><div className="evidence-list">{evidence.length ? evidence.map((item, index) => <article className="evidence-item" key={valueText(item.id, String(index))}><div className="evidence-item__head"><div><span className="record-index">EV-{String(index + 1).padStart(2, '0')}</span><h3>{valueText(item.kind, 'Доказательство')}</h3></div><time>{dateText(item.event_at ?? item.collected_at)}</time></div><p className="panel-intro">{valueText(item.summary)}</p><div className="evidence-item__source">{valueText(item.source, 'Источник не указан')} · ID {valueText(item.id)}</div>{item.data !== undefined && <pre className="evidence-data">{JSON.stringify(item.data, null, 2)}</pre>}</article>) : <Empty title="Доказательства ещё не собраны" detail="Проверьте ход плейбука и доступность источников. Без достаточных данных решение должно требовать проверки." />}</div></Panel>}
-        {tab === 'timeline' && <Panel><ol className="timeline">{timeline.length ? timeline.map((item, index) => <li key={valueText(item.id, String(index))}><div className="timeline__pin" /><div><time>{dateText(item.timeline_at)}</time><strong>{valueText(item.timeline_kind)}</strong><p>{valueText(item.summary ?? item.kind, valueText(item.status))}</p></div></li>) : <li className="timeline__empty"><Empty title="Шкала пока пуста" detail="Записи появятся после сохранения доказательств или действий." /></li>}</ol></Panel>}
+        {tab === 'decisions' && <Panel title="История решений">{decisions.length ? <div className="decision-history">{decisions.map((item, index) => <article className="decision-history__item" key={valueText(item.id, String(index))}><div className="decision-history__head"><div><strong>{valueText(item.summary, 'Решение')}</strong><small>{dateText(item.created_at)} · {valueText(item.actor, 'Система')}</small></div><Badge value={item.classification} /></div><p>{valueText(item.rationale, 'Обоснование не указано')}</p><Meta entries={[{ label: 'Уверенность', value: confidenceText(item.confidence) }, { label: 'Маршрут действий', value: <Badge value={item.verdict} /> }]} /><div className="claim-grid"><EvidenceClaims title="Подтверждающие факты" claims={records(item.evidence_for)} /><EvidenceClaims title="Противоречащие факты" claims={records(item.evidence_against)} /></div></article>)}</div> : <Empty title="Решений нет" detail="Классификация появится после обработки плейбука или проверки аналитика." />}</Panel>}
+        {tab === 'timeline' && <Panel><ol className="timeline">{timeline.length ? timeline.map((item, index) => <li key={valueText(item.id, String(index))}><div className="timeline__pin" /><div><time>{dateText(item.timeline_at)}</time><strong>{valueText(item.timeline_kind)}</strong><p>{valueText(item.summary ?? item.kind, valueText(item.status))}</p>{typeof item.timeline_detail === 'string' && <small>{item.timeline_detail}</small>}</div></li>) : <li className="timeline__empty"><Empty title="Шкала пока пуста" detail="Записи появятся после сохранения этапов конвейера, доказательств или действий." /></li>}</ol></Panel>}
         {tab === 'playbook' && <Panel>{playbooks.length ? <div className="playbook-list">{playbooks.map((item, index) => {
           const steps = Array.isArray(item.steps) ? item.steps.map(step => typeof step === 'string' ? { title: step } : asRecord(step)) : []
           return <article key={valueText(item.id, String(index))}><div className="playbook-list__head"><div><h3>{valueText(item.key, 'Общий плейбук')}</h3><p>Версия {valueText(item.version)}</p></div><Badge value={item.status} /></div><Meta entries={[{ label: 'Начат', value: dateText(item.started_at) }, { label: 'Завершён', value: dateText(item.completed_at) }]} />{steps.length > 0 && <ol className="steps">{steps.map((step, stepIndex) => <li key={stepIndex}><span>{stepIndex + 1}</span><div><strong>{valueText(first(step, 'title', 'name', 'step'), 'Шаг')}</strong><small>{valueText(first(step, 'detail', 'result', 'description'), '')}</small></div><Badge value={step.status} /></li>)}</ol>}</article>
         })}</div> : <Empty title="Плейбук не запускался" detail="Запись выполнения появится после обработки алерта фоновым worker." />}</Panel>}
-        {tab === 'actions' && <div className="action-grid"><Panel title="Действия">{actions.length ? <div className="stack-list">{actions.map((item, index) => <div className="operation-row" key={valueText(item.id, String(index))}><div><strong>{statusLabel(item.kind)}</strong><small>{dateText(item.completed_at ?? item.attempted_at)} · {valueText(item.external_id)}</small>{valueText(asRecord(item.detail).message, '') && <small>{valueText(asRecord(item.detail).message)}</small>}{item.status === 'unknown' && admin && <button className="button button--small button--secondary" disabled={!!actionBusy} onClick={() => void reconcile(valueText(item.id))}>Сверить результат</button>}</div><Badge value={item.status} /></div>)}</div> : <Empty title="Действий нет" detail="Автоматические действия выполняются только если их разрешает политика." />}</Panel><Panel title="Кейсы TheHive">{cases.length ? <div className="stack-list">{cases.map((item, index) => <div className="operation-row" key={valueText(item.id, String(index))}><div><strong>{valueText(item.title, 'Кейс')}</strong><small>Внешний ID: {valueText(item.external_id)}</small>{admin && settings.automation_level === 'approved_response' && (mode === 'demo' || settings.connected_writes_enabled === true) && valueText(item.external_id, '') && <CaseStatusControl key={valueText(item.id)} caseId={valueText(item.id)} currentStatus={valueText(item.status, '')} onUpdated={reload} />}</div><Badge value={item.status} /></div>)}</div> : <Empty title="Кейс не создан" detail="Кейс появится при подтверждённой эскалации и успешном ответе TheHive." />}</Panel></div>}
+        {tab === 'actions' && <div className="action-grid"><Panel title="Действия">{actions.length ? <div className="stack-list">{actions.map((item, index) => <div className="operation-row" key={valueText(item.id, String(index))}><div><strong>{statusLabel(item.kind)}</strong><small>{dateText(item.completed_at ?? item.attempted_at)} · {valueText(item.external_id)}</small>{valueText(asRecord(item.detail).message, '') && <small>{valueText(asRecord(item.detail).message)}</small>}{item.status === 'unknown' && admin && <button className="button button--small button--secondary" disabled={!!actionBusy} onClick={() => void reconcile(valueText(item.id))}>Сверить результат</button>}</div><Badge value={item.status} /></div>)}</div> : <Empty title="Действий нет" detail="Автоматические действия выполняются только если их разрешает политика." />}</Panel><Panel title="Кейсы TheHive">{cases.length ? <div className="stack-list">{cases.map((item, index) => <div className="operation-row" key={valueText(item.id, String(index))}><div><strong>{valueText(item.title, 'Кейс')}</strong><small>Внешний ID: {valueText(item.external_id)}</small>{admin && ['controlled_automation', 'approved_response'].includes(valueText(settings.automation_level)) && (mode === 'demo' || settings.connected_writes_enabled === true) && valueText(item.external_id, '') && <CaseStatusControl key={valueText(item.id)} caseId={valueText(item.id)} currentStatus={valueText(item.status, '')} onUpdated={reload} />}</div><Badge value={item.status} /></div>)}</div> : <Empty title="Кейс не создан" detail="Кейс появится при подтверждённой эскалации и успешном ответе TheHive." />}</Panel></div>}
         {tab === 'actions' && caseWrites.length > 0 && <Panel title="Этапы записи TheHive"><div className="stack-list">{caseWrites.map((item, index) => <div className="operation-row" key={valueText(item.id, String(index))}><div><strong>{valueText(item.sequence)}. {statusLabel(item.kind)}</strong><small>Попыток: {valueText(item.attempts)} · ID операции: {valueText(item.id)}</small><small>Подтверждение: {valueText(item.external_id, 'не получено')} · {dateText(item.completed_at ?? item.attempted_at)}</small>{typeof item.error_type === 'string' && item.error_type && <small>Ошибка: {item.error_type}</small>}</div><Badge value={item.status} /></div>)}</div></Panel>}
-      </div><aside className="detail-aside"><Panel title="Проверка аналитика"><p className="panel-intro">Сохранённое решение фиксируется в аудите. Действия по итогам решения проверяет серверная политика.</p><form className="form-stack" onSubmit={reviewed}><Field label="Вердикт"><select value={verdict} onChange={event => setVerdict(event.target.value)}><option value="needs_review">Нужна проверка</option><option value="true_positive">Подтверждено</option><option value="false_positive">Ложное срабатывание</option></select></Field><Field label="Обоснование"><textarea value={note} onChange={event => setNote(event.target.value)} required minLength={3} maxLength={2000} rows={5} placeholder="Укажите наблюдения и основания решения" /></Field><button className="button button--primary button--wide" disabled={mutation.busy}>{mutation.busy ? 'Сохранение…' : 'Сохранить решение'}</button><Notice flash={mutation.flash} /></form></Panel>
-        <Panel title="Разрешённые действия">{policy.error && <ErrorState message={policy.error} retry={policy.reload} />}{!policy.error && !canAct && <p className="panel-intro">Действия недоступны при текущей политике. Администратор может изменить уровень в настройках.</p>}{canAct && <div className="action-buttons"><button className="button button--secondary" disabled={!!actionBusy || inv.verdict !== 'true_positive'} onClick={() => void perform('create_case')}>Создать кейс</button><button className="button button--secondary" disabled={!!actionBusy || inv.verdict !== 'false_positive'} onClick={() => void perform('close_alert')}>Закрыть алерт</button>{mode === 'demo' && <><button className="button button--quiet" disabled={!!actionBusy} onClick={() => void perform('disable_account_demo')}>DEMO: блокировать учётную запись</button><button className="button button--quiet" disabled={!!actionBusy} onClick={() => void perform('isolate_host_demo')}>DEMO: изолировать хост</button></>}</div>}<Notice flash={actionFlash} /></Panel>
+      </div><aside className="detail-aside"><Panel title="Проверка аналитика"><p className="panel-intro">Классификация сохраняется в аудите. Действия по итогам решения проверяет серверная политика.</p>{canReview ? <form className="form-stack" onSubmit={reviewed}><Field label="Классификация"><select value={classification} onChange={event => setClassification(event.target.value)}>{classifications.map(key => <option key={key} value={key}>{statusLabel(key)}</option>)}</select></Field><Field label="Обоснование"><textarea value={note} onChange={event => setNote(event.target.value)} required minLength={3} maxLength={2000} rows={5} placeholder="Укажите наблюдения и основания решения" /></Field><button className="button button--primary button--wide" disabled={mutation.busy}>{mutation.busy ? 'Сохранение…' : 'Сохранить решение'}</button><Notice flash={mutation.flash} /></form> : <p className="panel-intro">Для изменения решения нужна роль аналитика или администратора.</p>}</Panel>
+        <Panel title="Разрешённые действия">{policy.error && <ErrorState message={policy.error} retry={policy.reload} />}{!policy.error && !canAct && <p className="panel-intro">Ручные действия доступны администратору только в режиме контролируемой автоматизации или разрешённого реагирования.</p>}{canAct && <div className="action-buttons"><button className="button button--secondary" disabled={!!actionBusy || inv.classification !== 'TP'} onClick={() => void perform('create_case')}>Создать кейс</button><button className="button button--secondary" disabled={!!actionBusy || inv.classification !== 'FP'} onClick={() => void perform('close_alert')}>Закрыть алерт</button>{mode === 'demo' && <><button className="button button--quiet" disabled={!!actionBusy} onClick={() => void perform('disable_account_demo')}>DEMO: блокировать учётную запись</button><button className="button button--quiet" disabled={!!actionBusy} onClick={() => void perform('isolate_host_demo')}>DEMO: изолировать хост</button></>}</div>}<Notice flash={actionFlash} /></Panel>
         <Panel title="Связанные алерты">{alerts.length ? <div className="related-list">{alerts.map((item, index) => <div key={valueText(item.id, String(index))}><strong>{valueText(item.title, 'Связанный алерт')}</strong><small>{valueText(item.source_event_id)} · {dateText(item.event_at)}</small></div>)}</div> : <p className="quiet">Связанные алерты не указаны.</p>}</Panel>
       </aside></div>
     </>}</>
@@ -427,6 +489,7 @@ function Investigation({ id, user }: { id: string; user: JsonRecord }) {
 const scopeFields = [
   ['host', 'Хост'], ['src_ip', 'IP источника'], ['auth_method', 'Метод входа'], ['peer', 'VPN peer'],
   ['device', 'Устройство'], ['tunnel', 'Туннель'], ['user', 'Пользователь'], ['command_line', 'Командная строка'],
+  ['dst_ip', 'IP назначения'], ['vpn_type', 'Тип VPN'], ['stage', 'Этап'],
 ] as const
 
 function ScopeEditor({ scope, onChange }: { scope: Record<string, string>; onChange: (value: Record<string, string>) => void }) {
@@ -439,18 +502,56 @@ function filledScope(scope: Record<string, string>): Record<string, string> {
 
 function scopeText(value: unknown): string {
   const entries = Object.entries(asRecord(value))
-  return entries.length ? entries.map(([key, item]) => `${key}=${valueText(item)}`).join(' · ') : 'Область не задана — только контекст'
+  return entries.length ? entries.map(([key, item]) => `${scopeFields.find(([field]) => field === key)?.[1] ?? key}: ${valueText(item)}`).join(' · ') : 'Область не задана — только контекст'
+}
+
+function dateInputValue(value: unknown): string {
+  const timestamp = dateValue(value)
+  if (timestamp === null) return ''
+  const date = new Date(timestamp)
+  return new Date(timestamp - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16)
+}
+
+function PolicyHistory({ id, onClose }: { id: string; onClose: () => void }) {
+  const { data, loading, error, reload } = useResource(`/exceptions/${encodeURIComponent(id)}/history`)
+  const history = asRecord(data)
+  const versions = records(history.versions)
+  const events = records(history.events)
+  return <Panel title="История политики" aside={<button className="button button--small button--secondary" onClick={onClose}>Закрыть историю</button>}>{error && <ErrorState message={error} retry={reload} />}{loading && !data ? <Loading /> : <><p className="panel-intro">Ключ политики: {valueText(history.policy_key)}</p><h3 className="subheading">Версии</h3><div className="simple-list">{versions.map(item => <div className="simple-row" key={valueText(item.id)}><div><strong>Версия {valueText(item.version)} · {valueText(item.rule_id)}</strong><small>{valueText(item.change_reason)} · {dateText(item.created_at)}</small><small>{scopeText(item.scope)}</small></div><Badge value={item.approval_status} /></div>)}</div><h3 className="subheading">События</h3>{events.length ? <ol className="policy-events">{events.map(item => <li key={valueText(item.id)}><time>{dateText(item.created_at)}</time><strong>{statusLabel(item.event_type)} · {valueText(item.actor)}</strong><span>{valueText(item.from_status, 'Создание')} → {statusLabel(item.to_status)}</span></li>)}</ol> : <p className="panel-intro">Событий пока нет.</p>}</>}</Panel>
+}
+
+function PolicyCard({ item, role, latest, onChanged, onVersion, onHistory }: { item: JsonRecord; role: string; latest: boolean; onChanged: () => void; onVersion: (item: JsonRecord) => void; onHistory: (id: string) => void }) {
+  const id = valueText(item.id)
+  const [revokeReason, setRevokeReason] = useState('')
+  const [showRevoke, setShowRevoke] = useState(false)
+  const mutation = useMutation()
+  const approve = () => void mutation.run(() => api(`/exceptions/${encodeURIComponent(id)}/approve`, { method: 'POST' }), 'Политика утверждена отдельным согласующим.', onChanged)
+  const revoke = async (event: FormEvent) => {
+    event.preventDefault()
+    const ok = await mutation.run(() => api(`/exceptions/${encodeURIComponent(id)}/revoke`, { method: 'POST', body: body({ reason: revokeReason.trim() }) }), 'Утверждение отозвано.', onChanged)
+    if (ok) { setShowRevoke(false); setRevokeReason('') }
+  }
+  return <article className="policy-row"><div className="policy-row__head"><div><strong>{valueText(item.entity)} · {valueText(item.rule_id)}</strong><small>Версия {valueText(item.version)} · автор {valueText(item.created_by)} · владелец {valueText(item.owner)}</small></div><Badge value={item.approval_status} /></div><p>{valueText(item.reason)}</p><small>{scopeText(item.scope)}</small><small>С {dateText(item.valid_from)} до {dateText(item.valid_until)}</small>{item.approval_status === 'approved' && (dateValue(item.valid_until) ?? Infinity) < Date.now() && <Badge value="expired" />}
+    <div className="policy-row__actions"><button className="button button--small button--secondary" onClick={() => onHistory(id)}>История</button>{role === 'admin' && latest && <button className="button button--small button--secondary" onClick={() => onVersion(item)}>Новая версия</button>}{role === 'policy_approver' && latest && item.approval_status === 'draft' && <button className="button button--small button--primary" disabled={mutation.busy} onClick={approve}>Утвердить</button>}{['admin', 'policy_approver'].includes(role) && item.approval_status === 'approved' && <button className="button button--small button--quiet" onClick={() => setShowRevoke(value => !value)}>Отозвать</button>}</div>
+    {showRevoke && <form className="policy-revoke" onSubmit={revoke}><Field label="Причина отзыва"><textarea value={revokeReason} onChange={event => setRevokeReason(event.target.value)} required minLength={10} maxLength={1000} rows={2} /></Field><button className="button button--small button--secondary" disabled={mutation.busy}>Подтвердить отзыв</button></form>}<Notice flash={mutation.flash} />
+  </article>
 }
 
 function Contexts({ user }: { user: JsonRecord }) {
   const exceptions = useResource('/exceptions')
   const maintenance = useResource('/maintenance')
-  const [rule, setRule] = useState('*')
+  const role = valueText(user.role).toLowerCase()
+  const admin = role === 'admin'
+  const [rule, setRule] = useState('')
   const [indicator, setIndicator] = useState('')
+  const [owner, setOwner] = useState('')
   const [reason, setReason] = useState('')
+  const [changeReason, setChangeReason] = useState('')
   const [exceptionScope, setExceptionScope] = useState<Record<string, string>>({})
   const [validFrom, setValidFrom] = useState('')
   const [expiresAt, setExpiresAt] = useState('')
+  const [versionSource, setVersionSource] = useState<JsonRecord | null>(null)
+  const [historyId, setHistoryId] = useState('')
   const [workTitle, setWorkTitle] = useState('')
   const [workEntity, setWorkEntity] = useState('')
   const [workReason, setWorkReason] = useState('')
@@ -459,12 +560,40 @@ function Contexts({ user }: { user: JsonRecord }) {
   const [endsAt, setEndsAt] = useState('')
   const exceptionMutation = useMutation()
   const maintenanceMutation = useMutation()
-  const admin = valueText(first(user, 'role')).toLowerCase() === 'admin'
+  const exceptionList = records(exceptions.data, 'exceptions')
+  const workList = records(maintenance.data, 'maintenance', 'works')
+  const latestByKey = new Map<string, number>()
+  for (const item of exceptionList) {
+    const key = valueText(item.policy_key)
+    latestByKey.set(key, Math.max(latestByKey.get(key) ?? 0, Number(item.version) || 0))
+  }
+  const clearPolicyForm = () => {
+    setRule(''); setIndicator(''); setOwner(''); setReason(''); setChangeReason('')
+    setExceptionScope({}); setValidFrom(''); setExpiresAt(''); setVersionSource(null)
+  }
+  const startVersion = (item: JsonRecord) => {
+    setVersionSource(item)
+    setRule(valueText(item.rule_id, ''))
+    setIndicator(valueText(item.entity, ''))
+    setOwner(valueText(item.owner, ''))
+    setReason(valueText(item.reason, ''))
+    setExceptionScope(Object.fromEntries(Object.entries(asRecord(item.scope)).map(([key, value]) => [key, valueText(value, '')])))
+    setValidFrom(dateInputValue(item.valid_from))
+    setExpiresAt(dateInputValue(item.valid_until))
+    setChangeReason('')
+    window.requestAnimationFrame(() => document.getElementById('policy-editor')?.scrollIntoView({ block: 'start' }))
+  }
   const addException = async (event: FormEvent) => {
     event.preventDefault()
-    const payload: JsonRecord = { rule, entity: indicator, reason, scope: filledScope(exceptionScope), valid_from: new Date(validFrom).toISOString(), valid_until: new Date(expiresAt).toISOString() }
-    const ok = await exceptionMutation.run(() => api('/exceptions', { method: 'POST', body: body(payload) }), 'Исключение создано.', exceptions.reload)
-    if (ok) { setIndicator(''); setReason(''); setExceptionScope({}); setValidFrom(''); setExpiresAt('') }
+    const payload: JsonRecord = {
+      rule: rule.trim(), entity: indicator.trim(), owner: owner.trim(), reason: reason.trim(),
+      change_reason: changeReason.trim(), scope: filledScope(exceptionScope),
+      valid_from: new Date(validFrom).toISOString(), valid_until: new Date(expiresAt).toISOString(),
+    }
+    const endpoint = versionSource ? '/exceptions/' + encodeURIComponent(valueText(versionSource.id)) + '/versions' : '/exceptions'
+    const ok = await exceptionMutation.run(() => api(endpoint, { method: 'POST', body: body(payload) }),
+      versionSource ? 'Новая версия сохранена как черновик.' : 'Политика сохранена как черновик.', exceptions.reload)
+    if (ok) clearPolicyForm()
   }
   const addMaintenance = async (event: FormEvent) => {
     event.preventDefault()
@@ -472,9 +601,38 @@ function Contexts({ user }: { user: JsonRecord }) {
     const ok = await maintenanceMutation.run(() => api('/maintenance', { method: 'POST', body: body(payload) }), 'Согласованная работа сохранена.', maintenance.reload)
     if (ok) { setWorkTitle(''); setWorkEntity(''); setWorkReason(''); setMaintenanceScope({}); setStartsAt(''); setEndsAt('') }
   }
-  const exceptionList = records(exceptions.data, 'exceptions')
-  const workList = records(maintenance.data, 'maintenance', 'works')
-  return <><PageHead title="Исключения и согласованные работы" description="Каждое основание ограничено по времени и привязано к заказчику." /><div className="two-column"><Panel title="Исключения" aside={<span className="quiet">{exceptionList.length} записей</span>}>{exceptions.error && <ErrorState message={exceptions.error} retry={exceptions.reload} />}{exceptions.loading && !exceptions.data ? <Loading /> : exceptionList.length ? <div className="simple-list">{exceptionList.map((item, index) => <div className="simple-row" key={valueText(first(item, 'id'), String(index))}><div><strong>{valueText(first(item, 'entity', 'indicator', 'value', 'pattern'))}</strong><small>{valueText(first(item, 'rule'))} · {valueText(first(item, 'reason'))}</small><small>До {dateText(first(item, 'valid_until', 'expires_at'))}</small><small>{scopeText(item.scope)}</small></div><Badge value={!Object.keys(asRecord(item.scope)).length ? 'context' : new Date(valueText(item.valid_until)).getTime() < Date.now() ? 'expired' : 'active'} /></div>)}</div> : <Empty title="Исключений нет" detail="Исторические ложные срабатывания не становятся действующими исключениями автоматически." />}{admin && <form className="inline-form" onSubmit={addException}><h3>Новое исключение</h3><div className="form-grid"><Field label="Правило"><input required value={rule} onChange={event => setRule(event.target.value)} placeholder="* или ключ плейбука" /></Field><Field label="Сущность"><input required value={indicator} onChange={event => setIndicator(event.target.value)} placeholder="IP, хост или пользователь" /></Field><Field label="Основание"><input required value={reason} onChange={event => setReason(event.target.value)} /></Field><Field label="Действует с"><input type="datetime-local" required value={validFrom} onChange={event => setValidFrom(event.target.value)} /></Field><Field label="Действует до"><input type="datetime-local" min={validFrom} required value={expiresAt} onChange={event => setExpiresAt(event.target.value)} /></Field></div><ScopeEditor scope={exceptionScope} onChange={setExceptionScope} /><button className="button button--secondary" disabled={exceptionMutation.busy}>Создать исключение</button><Notice flash={exceptionMutation.flash} /></form>}</Panel><Panel title="Согласованные работы" aside={<span className="quiet">{workList.length} записей</span>}>{maintenance.error && <ErrorState message={maintenance.error} retry={maintenance.reload} />}{maintenance.loading && !maintenance.data ? <Loading /> : workList.length ? <div className="simple-list">{workList.map((item, index) => <div className="simple-row" key={valueText(first(item, 'id'), String(index))}><div><strong>{valueText(first(item, 'title', 'name'))}</strong><small>{dateText(first(item, 'valid_from', 'starts_at'))} — {dateText(first(item, 'valid_until', 'ends_at'))}</small><small>{valueText(first(item, 'entity'))} · {valueText(first(item, 'reason'))}</small><small>{scopeText(item.scope)}</small></div><Badge value={!Object.keys(asRecord(item.scope)).length ? 'context' : new Date(valueText(item.valid_until)).getTime() < Date.now() ? 'expired' : 'active'} /></div>)}</div> : <Empty title="Работы не зарегистрированы" detail="Согласованное окно должно быть явно сохранено, прежде чем плейбук сможет использовать его как контекст." />}{admin && <form className="inline-form" onSubmit={addMaintenance}><h3>Добавить работу</h3><div className="form-grid"><Field label="Название"><input required value={workTitle} onChange={event => setWorkTitle(event.target.value)} /></Field><Field label="Сущность"><input required value={workEntity} onChange={event => setWorkEntity(event.target.value)} placeholder="IP, хост или пользователь" /></Field><Field label="Основание"><input required value={workReason} onChange={event => setWorkReason(event.target.value)} /></Field><Field label="Начало"><input type="datetime-local" required value={startsAt} onChange={event => setStartsAt(event.target.value)} /></Field><Field label="Конец"><input type="datetime-local" required min={startsAt} value={endsAt} onChange={event => setEndsAt(event.target.value)} /></Field></div><ScopeEditor scope={maintenanceScope} onChange={setMaintenanceScope} /><button className="button button--secondary" disabled={maintenanceMutation.busy}>Сохранить работу</button><Notice flash={maintenanceMutation.flash} /></form>}</Panel></div></>
+  return <><PageHead title="Политики FP и согласованные работы" description="Исключение действует только после отдельного утверждения, при совпадении области и срока." />
+    <div className="two-column">
+      <Panel title="Политики FP" aside={<span className="quiet">{exceptionList.length} версий</span>}>
+        {exceptions.error && <ErrorState message={exceptions.error} retry={exceptions.reload} />}
+        {exceptions.loading && !exceptions.data ? <Loading /> : exceptionList.length ? <div className="policy-list">{exceptionList.map(item =>
+          <PolicyCard key={valueText(item.id)} item={item} role={role}
+            latest={Number(item.version) === latestByKey.get(valueText(item.policy_key))}
+            onChanged={exceptions.reload} onVersion={startVersion} onHistory={setHistoryId} />
+        )}</div> : <Empty title="Политик нет" detail="Исторические ложные срабатывания не становятся действующими исключениями автоматически." />}
+        {admin && <form id="policy-editor" className="inline-form" onSubmit={addException}>
+          <h3>{versionSource ? 'Новая версия политики' : 'Предложить политику'}</h3>
+          <p className="panel-intro">Черновик не разрешает автозакрытие. Для утверждения нужен отдельный пользователь с ролью согласующего.</p>
+          <div className="form-grid">
+            <Field label="Правило" hint="Для утверждения: root_ssh, vpn_country, ipsec_failure, brute_force или powershell"><input required maxLength={100} value={rule} onChange={event => setRule(event.target.value)} placeholder="Ключ плейбука" /></Field>
+            <Field label="Сущность"><input required maxLength={256} value={indicator} onChange={event => setIndicator(event.target.value)} placeholder="Точное значение одного поля области" /></Field>
+            <Field label="Владелец"><input required maxLength={100} value={owner} onChange={event => setOwner(event.target.value)} /></Field>
+            <Field label="Основание"><input required minLength={10} maxLength={2000} value={reason} onChange={event => setReason(event.target.value)} /></Field>
+            <Field label="Действует с"><input type="datetime-local" required value={validFrom} onChange={event => setValidFrom(event.target.value)} /></Field>
+            <Field label="Действует до"><input type="datetime-local" min={validFrom} required value={expiresAt} onChange={event => setExpiresAt(event.target.value)} /></Field>
+          </div>
+          <ScopeEditor scope={exceptionScope} onChange={setExceptionScope} />
+          <Field label="Причина предложения или изменения"><textarea required minLength={versionSource ? 10 : 3} maxLength={1000} rows={2} value={changeReason} onChange={event => setChangeReason(event.target.value)} /></Field>
+          <div className="policy-row__actions"><button className="button button--secondary" disabled={exceptionMutation.busy}>{exceptionMutation.busy ? 'Сохранение…' : versionSource ? 'Создать новую версию' : 'Создать черновик'}</button>{versionSource && <button type="button" className="button button--quiet" onClick={clearPolicyForm}>Отмена</button>}</div>
+          <Notice flash={exceptionMutation.flash} />
+        </form>}
+      </Panel>
+      <Panel title="Согласованные работы" aside={<span className="quiet">{workList.length} записей</span>}>
+        {maintenance.error && <ErrorState message={maintenance.error} retry={maintenance.reload} />}
+        {maintenance.loading && !maintenance.data ? <Loading /> : workList.length ? <div className="simple-list">{workList.map((item, index) => <div className="simple-row" key={valueText(first(item, 'id'), String(index))}><div><strong>{valueText(first(item, 'title', 'name'))}</strong><small>{dateText(first(item, 'valid_from', 'starts_at'))} — {dateText(first(item, 'valid_until', 'ends_at'))}</small><small>{valueText(first(item, 'entity'))} · {valueText(first(item, 'reason'))}</small><small>{scopeText(item.scope)}</small></div><Badge value={!Object.keys(asRecord(item.scope)).length ? 'context' : new Date(valueText(item.valid_until)).getTime() < Date.now() ? 'expired' : 'active'} /></div>)}</div> : <Empty title="Работы не зарегистрированы" detail="Согласованное окно должно быть явно сохранено, прежде чем плейбук сможет использовать его как контекст." />}
+        {admin && <form className="inline-form" onSubmit={addMaintenance}><h3>Добавить работу</h3><div className="form-grid"><Field label="Название"><input required value={workTitle} onChange={event => setWorkTitle(event.target.value)} /></Field><Field label="Сущность"><input required value={workEntity} onChange={event => setWorkEntity(event.target.value)} placeholder="IP, хост или пользователь" /></Field><Field label="Основание"><input required value={workReason} onChange={event => setWorkReason(event.target.value)} /></Field><Field label="Начало"><input type="datetime-local" required value={startsAt} onChange={event => setStartsAt(event.target.value)} /></Field><Field label="Конец"><input type="datetime-local" required min={startsAt} value={endsAt} onChange={event => setEndsAt(event.target.value)} /></Field></div><ScopeEditor scope={maintenanceScope} onChange={setMaintenanceScope} /><button className="button button--secondary" disabled={maintenanceMutation.busy}>Сохранить работу</button><Notice flash={maintenanceMutation.flash} /></form>}
+      </Panel>
+    </div>{historyId && <PolicyHistory key={historyId} id={historyId} onClose={() => setHistoryId('')} />}</>
 }
 
 const assetKinds = ['host', 'ip', 'user', 'vpn_peer', 'device'] as const
@@ -708,6 +866,7 @@ function Settings({ user }: { user: JsonRecord }) {
   const [mode, setMode] = useState('')
   const [level, setLevel] = useState('')
   const [confirmed, setConfirmed] = useState(false)
+  const [validation, setValidation] = useState('')
   const mutation = useMutation()
   const admin = valueText(first(user, 'role')).toLowerCase() === 'admin'
   useEffect(() => { if (data) { setMode(valueText(first(current, 'mode', 'system_mode'), 'unknown').toLowerCase()); setLevel(valueText(first(current, 'automation_level', 'autonomy_level', 'action_level'), 'observe')) } }, [data])
@@ -715,14 +874,31 @@ function Settings({ user }: { user: JsonRecord }) {
     event.preventDefault()
     const previousLevel = valueText(first(current, 'automation_level', 'autonomy_level', 'action_level'), 'observe')
     if (level !== previousLevel && !confirmed) {
-      await mutation.run(async () => { throw new Error('Подтвердите изменение политики действий') }, '')
+      setValidation('Подтвердите изменение политики действий.')
       return
     }
+    setValidation('')
     const payload = { automation_level: level }
     const ok = await mutation.run(() => api('/settings', { method: 'PATCH', body: body(payload) }), 'Политика сохранена и записана в аудит.', reload)
     if (ok) setConfirmed(false)
   }
-  return <><PageHead title="Политика действий" description="Уровень автономности определяет сервер. Изменение доступно только администратору и записывается в аудит." />{error && <ErrorState message={error} retry={reload} />}{loading && !data ? <Loading /> : <div className="settings-layout"><Panel title="Режим и автономность"><form className="form-stack" onSubmit={save}><Field label="Режим"><div className="read-only-field">{mode === 'demo' ? 'DEMO — симуляторы' : mode === 'connected' ? 'CONNECTED — реальные API' : 'Неизвестно'}</div></Field><Field label="Уровень действий"><select disabled={!admin} value={level} onChange={event => setLevel(event.target.value)}><option value="observe">observe — анализ и рекомендации</option><option value="auto_close">auto_close — разрешённое автозакрытие</option><option value="approved_response">approved_response — действия по политике</option></select></Field><div className="policy-callout"><strong>Проверка выполняется сервером</strong><p>Вердикт аналитика или модели сам по себе не разрешает внешнее действие. Для автозакрытия дополнительно нужна включённая глобальная настройка AUTO_CLOSE_ENABLED и проверка правил.</p></div>{admin && <><label className="check-row"><input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />Подтверждаю изменение политики и понимаю режим внешних действий.</label><button className="button button--primary" disabled={mutation.busy}>{mutation.busy ? 'Сохранение…' : 'Сохранить политику'}</button></>}<Notice flash={mutation.flash} /></form></Panel><Panel title="Текущее состояние"><Meta entries={[{ label: 'Режим', value: <Badge value={mode} label={mode ? mode.toUpperCase() : 'Неизвестно'} /> }, { label: 'Автономность', value: <Badge value={level} /> }, { label: 'Глобальное автозакрытие', value: valueText(current.auto_close_enabled, 'Неизвестно') }, { label: 'Реальные операции записи', value: valueText(first(current, 'connected_writes_enabled', 'connected_write_enabled', 'write_enabled'), 'Неизвестно') }, { label: 'Источник настроек', value: 'Сервер' }]} /><p className="panel-intro">Режим определяется конфигурацией сервера. Настройка API ключей выполняется через переменные окружения; секреты не показываются в интерфейсе.</p></Panel></div>}</>
+  return <><PageHead title="Политика действий" description="Уровень автономности определяет сервер. Изменение доступно только администратору и записывается в аудит." />{error && <ErrorState message={error} retry={reload} />}{loading && !data ? <Loading /> : <div className="settings-layout"><Panel title="Режим и автономность"><form className="form-stack" onSubmit={save}><Field label="Режим"><div className="read-only-field">{mode === 'demo' ? 'DEMO — симуляторы' : mode === 'connected' ? 'CONNECTED — реальные API' : 'Неизвестно'}</div></Field><Field label="Уровень действий"><select disabled={!admin} value={level} onChange={event => { setLevel(event.target.value); setConfirmed(false); setValidation('') }}><option value="disabled">disabled — внешние действия отключены</option><option value="observe">observe — наблюдение без действий</option><option value="recommend">recommend — рекомендации без действий</option><option value="controlled_automation" disabled={mode === 'connected' && current.connected_writes_enabled !== true}>controlled_automation — контролируемые действия</option><option value="auto_close" disabled={mode === 'connected' && current.connected_writes_enabled !== true}>auto_close — разрешённое автозакрытие</option><option value="approved_response" disabled={mode === 'connected' && current.connected_writes_enabled !== true}>approved_response — разрешённое реагирование</option></select></Field><div className="policy-callout"><strong>Проверка выполняется сервером</strong><p>Классификация сама по себе не разрешает внешнее действие. Для закрытия FP нужны действующая утверждённая политика, совпадающая область и серверная проверка. CONNECTED операции записи требуют отдельной настройки сервера.</p></div>{admin && <><label className="check-row"><input type="checkbox" checked={confirmed} onChange={event => { setConfirmed(event.target.checked); setValidation('') }} />Подтверждаю изменение политики и понимаю режим внешних действий.</label>{validation && <div className="form-error" role="alert">{validation}</div>}<button className="button button--primary" disabled={mutation.busy || level === valueText(current.automation_level)}>{mutation.busy ? 'Сохранение…' : 'Сохранить политику'}</button></>}<Notice flash={mutation.flash} /></form></Panel><Panel title="Текущее состояние"><Meta entries={[{ label: 'Режим', value: <Badge value={mode} label={mode ? mode.toUpperCase() : 'Неизвестно'} /> }, { label: 'Автономность', value: <Badge value={level} /> }, { label: 'Глобальное автозакрытие', value: valueText(current.auto_close_enabled, 'Неизвестно') }, { label: 'Реальные операции записи', value: valueText(first(current, 'connected_writes_enabled', 'connected_write_enabled', 'write_enabled'), 'Неизвестно') }, { label: 'Источник настроек', value: 'Сервер' }]} /><p className="panel-intro">Режим определяется конфигурацией сервера. Настройка API ключей выполняется через переменные окружения; секреты не показываются в интерфейсе.</p></Panel></div>}</>
+}
+
+function Users() {
+  const { data, loading, error, reload } = useResource('/users')
+  const mutation = useMutation()
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [role, setRole] = useState('policy_approver')
+  const create = async (event: FormEvent) => {
+    event.preventDefault()
+    const ok = await mutation.run(() => api('/users', { method: 'POST', body: body({ username: username.trim(), password, role }) }), 'Пользователь создан.', reload)
+    if (ok) { setUsername(''); setPassword('') }
+  }
+  const roleLabel = (value: unknown) => ({ admin: 'Администратор', analyst: 'Аналитик', viewer: 'Наблюдатель', policy_approver: 'Согласующий политик' })[valueText(value)] ?? valueText(value)
+  const list = records(data)
+  return <><PageHead title="Пользователи" description="Согласующий утверждает политики независимо от администратора, который создаёт черновики." actions={<button className="button button--secondary" onClick={reload}>Обновить</button>} />{error && <ErrorState message={error} retry={reload} />}{loading && !data ? <Loading /> : <div className="two-column"><Panel title="Участники"><div className="simple-list">{list.map(item => <div className="simple-row" key={valueText(item.id)}><div><strong>{valueText(item.username)}</strong><small>{roleLabel(item.role)}</small></div><Badge value={item.active === true ? 'active' : 'revoked'} label={item.active === true ? 'Активен' : 'Отключён'} /></div>)}</div></Panel><Panel title="Создать учётную запись"><form className="form-stack" onSubmit={create}><Field label="Имя пользователя"><input required minLength={3} maxLength={100} pattern="[A-Za-z0-9][A-Za-z0-9_.-]{2,99}" autoComplete="off" value={username} onChange={event => setUsername(event.target.value)} /></Field><Field label="Новый пароль" hint="От 12 до 128 символов"><input required type="password" minLength={12} maxLength={128} autoComplete="new-password" value={password} onChange={event => setPassword(event.target.value)} /></Field><Field label="Роль"><select value={role} onChange={event => setRole(event.target.value)}><option value="policy_approver">Согласующий политик</option><option value="analyst">Аналитик</option><option value="viewer">Наблюдатель</option></select></Field><button className="button button--primary" disabled={mutation.busy}>{mutation.busy ? 'Создание…' : 'Создать пользователя'}</button><Notice flash={mutation.flash} /></form></Panel></div>}</>
 }
 
 function Scenarios({ user }: { user: JsonRecord }) {
@@ -822,11 +998,13 @@ export default function App() {
     if (path.startsWith('/investigations/')) return <Investigation id={decodeURIComponent(path.split('/')[2] || '')} user={user} />
     if (path === '/contexts') return <Contexts user={user} />
     if (path === '/assets') return <Assets user={user} />
+    if (path === '/metrics' && user.role === 'admin') return <Metrics />
     if (path === '/integrations') return <Integrations user={user} />
     if (path === '/sla') return <Sla />
     if (path === '/shifts') return <Shifts user={user} />
     if (path === '/audit') return <Audit />
     if (path === '/settings' && user.role === 'admin') return <Settings user={user} />
+    if (path === '/users' && user.role === 'admin') return <Users />
     if (path === '/scenarios' && valueText(user.mode).toLowerCase() === 'demo') return <Scenarios user={user} />
     if (path === '/dead-letters') return <DeadLetters user={user} />
     return <><PageHead title="Страница не найдена" description="Проверьте адрес или вернитесь к рабочей очереди." /><Link className="button button--primary" to="/">К обзору</Link></>

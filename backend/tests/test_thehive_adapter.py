@@ -59,6 +59,32 @@ def test_thehive_version_checked_before_case_write_and_cached(monkeypatch):
     assert sum(path == "/api/v1/status" for _, path, _ in calls) == 1
 
 
+def test_thehive_create_uses_frozen_case_severity_tags_and_interval(monkeypatch):
+    adapter = real_adapter()
+    monkeypatch.setattr(adapters, "settings", lambda: SimpleNamespace(thehive_api_version="5.7"))
+    calls = []
+
+    def request(method, path, body=None):
+        calls.append((method, path, body))
+        if path == "/api/v1/status":
+            return {"version": "5.7.3"}
+        if path == "/api/v1/query":
+            return []
+        return {"_id": "~case-2"}
+
+    monkeypatch.setattr(adapter, "_request", request)
+    assert adapter.create_case("Case", "Description", "key-2", severity=3,
+                               tags=["soc-l1", "classification:tp"],
+                               start_date=1_762_000_000_000,
+                               end_date=1_762_000_060_000) == "~case-2"
+    payload = calls[-1][2]
+    assert payload == {"title": "Case", "description": "Description", "severity": 3,
+                       "tags": ["soc-key:key-2", "soc-l1", "classification:tp"], "flag": False,
+                       "startDate": 1_762_000_000_000, "endDate": 1_762_000_060_000}
+    with pytest.raises(AdapterError, match="критичность"):
+        adapter.create_case("Case", "Description", "key-3", severity=5)
+
+
 def test_thehive_case_readback_requires_exact_idempotency_tag(monkeypatch):
     adapter = real_adapter()
     monkeypatch.setattr(adapter, "_request", lambda *args: [{"_id": "~case-1", "tags": ["other"]}])

@@ -1,0 +1,94 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: soc
+      POSTGRES_USER: soc
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-soc-demo-only}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U soc -d soc"]
+      interval: 5s
+      retries: 15
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "60", "1"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 15
+  backend:
+    build: ./backend
+    environment: &backend_env
+      MODE: ${MODE:-DEMO}
+      DATABASE_URL: postgresql+psycopg://soc:${POSTGRES_PASSWORD:-soc-demo-only}@db:5432/soc
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-demo-secret-change-before-exposure-1234567890}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-demo-webhook-change-before-exposure}
+      DEMO_ADMIN_PASSWORD: ${DEMO_ADMIN_PASSWORD:-admin-demo}
+      DEMO_ANALYST_PASSWORD: ${DEMO_ANALYST_PASSWORD:-analyst-demo}
+      CONNECTED_ADMIN_PASSWORD: ${CONNECTED_ADMIN_PASSWORD:-}
+      CONNECTED_ANALYST_PASSWORD: ${CONNECTED_ANALYST_PASSWORD:-}
+      CONNECTED_WRITES_ENABLED: ${CONNECTED_WRITES_ENABLED:-false}
+      CONNECTED_ALLOWED_ACTIONS: ${CONNECTED_ALLOWED_ACTIONS:-}
+      AUTO_CLOSE_ENABLED: ${AUTO_CLOSE_ENABLED:-false}
+      SPLUNK_BASE_URL: ${SPLUNK_BASE_URL:-}
+      SPLUNK_TOKEN: ${SPLUNK_TOKEN:-}
+      SPLUNK_SEARCH_TEMPLATE: ${SPLUNK_SEARCH_TEMPLATE:-search index=main earliest={earliest} latest={latest} | head 200}
+      SPLUNK_POLL_SECONDS: ${SPLUNK_POLL_SECONDS:-60}
+      SPLUNK_OVERLAP_SECONDS: ${SPLUNK_OVERLAP_SECONDS:-120}
+      THEHIVE_BASE_URL: ${THEHIVE_BASE_URL:-}
+      THEHIVE_API_KEY: ${THEHIVE_API_KEY:-}
+      THEHIVE_API_VERSION: ${THEHIVE_API_VERSION:-}
+      MISP_BASE_URL: ${MISP_BASE_URL:-}
+      MISP_API_KEY: ${MISP_API_KEY:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-}
+      OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-15}
+      OLLAMA_MAX_INPUT_CHARS: ${OLLAMA_MAX_INPUT_CHARS:-12000}
+      OLLAMA_MAX_OUTPUT_BYTES: ${OLLAMA_MAX_OUTPUT_BYTES:-100000}
+      OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-4096}
+      OLLAMA_MAX_CONCURRENT: ${OLLAMA_MAX_CONCURRENT:-2}
+      TIMEZONE: ${TIMEZONE:-Asia/Qyzylorda}
+      INVESTIGATION_TIMEOUT_SECONDS: ${INVESTIGATION_TIMEOUT_SECONDS:-90}
+      MAX_EVIDENCE_ITEMS: ${MAX_EVIDENCE_ITEMS:-50}
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/ready', timeout=3)"]
+      interval: 10s
+      retries: 15
+  worker:
+    build: ./backend
+    command: ["celery", "-A", "app.tasks:celery_app", "worker", "--loglevel=INFO", "--concurrency=2"]
+    environment: *backend_env
+    depends_on:
+      backend: {condition: service_healthy}
+  beat:
+    build: ./backend
+    command: ["celery", "-A", "app.tasks:celery_app", "beat", "--loglevel=INFO"]
+    environment: *backend_env
+    depends_on:
+      backend: {condition: service_healthy}
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      backend: {condition: service_healthy}
+  ollama:
+    image: ollama/ollama:0.40.8
+    profiles: [llm]
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_NO_CLOUD: "1"
+    volumes:
+      - ollama_data:/root/.ollama
+volumes:
+  postgres_data:
+  redis_data:
+  ollama_data:

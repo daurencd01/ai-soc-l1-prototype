@@ -1,0 +1,14 @@
+.env
+.qa/
+.pytest_cache/
+__pycache__/
+*.pyc
+backend/.venv/
+backend/.pytest_cache/
+backend/**/__pycache__/
+backend/**/*.pyc
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+frontend/.impeccable/
+shift-*.docx

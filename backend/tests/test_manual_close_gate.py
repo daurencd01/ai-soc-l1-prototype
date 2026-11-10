@@ -9,6 +9,8 @@ from sqlalchemy.pool import StaticPool
 
 from app.db import Base, get_db
 from app.main import app
+import app.main as main_module
+from app.metrics import metric_snapshot
 from app.models import (Action, Alert, Audit, Case, Decision, ExceptionRule, Investigation,
                         Maintenance, PolicyEvent, Tenant, User, utcnow)
 from app.scenarios import instantiate_scenario
@@ -182,6 +184,65 @@ def test_real_fp_detection_can_close_with_current_approved_policy(site):
     result = close(client, ids["admin"], inv_id)
     assert result.status_code == 200, result.text
     assert result.json()["status"] == "succeeded"
+    with Session(engine) as db:
+        inv = db.get(Investigation, inv_id)
+        alert = db.scalar(select(Alert).where(Alert.investigation_id == inv_id))
+        assert inv.status == "closed" and alert.status == "closed"
+        assert alert.pipeline_state == "CLOSED_FP"
+        assert metric_snapshot(db, ids["tenant"])["auto_close_attempts_total"] == 0
+
+
+def test_multiple_linked_alerts_cannot_be_closed_as_one(site):
+    engine, client, ids = site
+    inv_id = prepare(engine, ids["tenant"], scenario="root_parser_false_positive")
+    with Session(engine) as db:
+        original = db.scalar(select(Alert).where(Alert.investigation_id == inv_id))
+        db.add(Alert(tenant_id=ids["tenant"], investigation_id=inv_id,
+                     source=original.source, source_event_id="another-linked-event",
+                     rule=original.rule, title=original.title, severity=original.severity,
+                     status="needs_review", pipeline_state="NEEDS_REVIEW",
+                     event_at=original.event_at, raw=original.raw))
+        db.commit()
+    assert_denied(engine, ids["tenant"], close(client, ids["admin"], inv_id),
+                  "multiple_linked_alerts")
+
+
+def test_unknown_close_reconciliation_uses_original_alert(site, monkeypatch):
+    engine, client, ids = site
+    inv_id = prepare(engine, ids["tenant"], scenario="root_parser_false_positive")
+    with Session(engine) as db:
+        original = db.scalar(select(Alert).where(Alert.investigation_id == inv_id))
+        linked = Alert(tenant_id=ids["tenant"], investigation_id=inv_id,
+                       source=original.source, source_event_id="second-source-event",
+                       rule=original.rule, title=original.title, severity=original.severity,
+                       status="needs_review", pipeline_state="NEEDS_REVIEW",
+                       event_at=original.event_at, raw=original.raw)
+        db.add(linked)
+        db.flush()
+        action = Action(tenant_id=ids["tenant"], investigation_id=inv_id,
+                        kind="close_alert", status="unknown", target=linked.source_event_id,
+                        idempotency_key=f"{inv_id}:close_alert:{linked.id}")
+        db.add(action)
+        db.commit()
+        action_id, linked_id = action.id, linked.id
+    seen = []
+
+    def capture_action(db, tenant, investigation, alert, kind, evidence):
+        seen.append(alert.id)
+        return db.get(Action, action_id)
+
+    monkeypatch.setattr(main_module, "perform_action", capture_action)
+    headers = {"Authorization": f"Bearer {ids['admin']}"}
+    response = client.post(f"/api/actions/{action_id}/reconcile", headers=headers)
+    assert response.status_code == 200, response.text
+    assert seen == [linked_id]
+    with Session(engine) as db:
+        action = db.get(Action, action_id)
+        action.target = "mismatched-source-event"
+        db.commit()
+    rejected = client.post(f"/api/actions/{action_id}/reconcile", headers=headers)
+    assert rejected.status_code == 409
+    assert seen == [linked_id]
 
 
 def test_real_fp_auto_close_requires_global_flag(site, monkeypatch):
@@ -195,3 +256,7 @@ def test_real_fp_auto_close_requires_global_flag(site, monkeypatch):
         actions = db.scalars(select(Action).where(Action.investigation_id == inv_id,
                                                   Action.kind == "close_alert")).all()
         assert len(actions) == 1 and actions[0].status == "succeeded"
+        markers = db.scalars(select(Audit).where(Audit.tenant_id == ids["tenant"],
+            Audit.operation == "auto_close_attempted", Audit.subject_id == actions[0].id)).all()
+        assert len(markers) == 1
+        assert metric_snapshot(db, ids["tenant"])["auto_close_attempts_total"] == 1

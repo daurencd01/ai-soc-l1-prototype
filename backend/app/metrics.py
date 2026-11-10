@@ -16,7 +16,15 @@ def _count(db: Session, model: type, tenant_id: str, *conditions: object) -> int
 
 
 def metric_snapshot(db: Session, tenant_id: str) -> dict:
-    """Return only aggregates; never place event fields in metric labels."""
+    """Return tenant aggregates without event payloads.
+
+    The handling rate denominator is investigations with completed_at set.
+    Its numerator is current automated terminal outcomes (case created,
+    suppressed or FP closed) with no analyst review or manual action recorded.
+    It measures workflow handling, not accuracy or analyst time saved.
+    An automatic close attempt is counted only after its action is durably
+    created with a distinct audit marker; manual closes are excluded.
+    """
     triage = {classification: int(count) for classification, count in db.execute(
         select(Decision.classification, func.count()).where(Decision.tenant_id == tenant_id)
         .group_by(Decision.classification)
@@ -39,13 +47,28 @@ def metric_snapshot(db: Session, tenant_id: str) -> dict:
         if duration >= 0:
             duration_count += 1
             total_duration += duration
+    processed = _count(db, Investigation, tenant_id, Investigation.completed_at.is_not(None))
+    reviewed = select(Audit.subject_id).where(
+        Audit.tenant_id == tenant_id, Audit.operation == "review",
+        Audit.subject_type == "investigation")
+    manually_acted = select(Action.investigation_id).join(
+        Audit, Audit.subject_id == Action.id).where(
+        Action.tenant_id == tenant_id, Audit.tenant_id == tenant_id,
+        Audit.subject_type == "action", Audit.operation == "manual_action_requested")
+    automated = _count(
+        db, Investigation, tenant_id,
+        Investigation.completed_at.is_not(None),
+        Investigation.status.in_(("escalated", "suppressed", "auto_closed")),
+        ~Investigation.id.in_(reviewed),
+        ~Investigation.id.in_(manually_acted),
+    )
     return {
         "alert_ingestion_total": _count(db, Alert, tenant_id),
         "alert_deduplicated_total": _count(db, Audit, tenant_id, Audit.operation == "alert_deduplicated"),
         "triage_results_total": {key: triage.get(key, 0) for key in CLASSES},
         "cases_created_total": _count(db, Action, tenant_id, Action.kind == "create_case", Action.status == "succeeded"),
         "cases_suppressed_total": _count(db, Alert, tenant_id, Alert.pipeline_state == "SUPPRESSED"),
-        "auto_close_attempts_total": _count(db, Action, tenant_id, Action.kind == "close_alert"),
+        "auto_close_attempts_total": _count(db, Audit, tenant_id, Audit.operation == "auto_close_attempted"),
         "auto_close_denied_total": _count(db, Audit, tenant_id, Audit.operation == "auto_close_denied"),
         "processing_duration_seconds": {
             "count": duration_count,
@@ -54,4 +77,7 @@ def metric_snapshot(db: Session, tenant_id: str) -> dict:
         },
         "integration_errors_total": _count(db, Audit, tenant_id, Audit.operation == "integration_error"),
         "queue_depth": _count(db, Alert, tenant_id, Alert.status.in_(("queued", "running"))),
+        "automated_handling_rate": round(automated / processed, 4) if processed else None,
+        "automated_handling_total": automated,
+        "processed_investigations_total": processed,
     }

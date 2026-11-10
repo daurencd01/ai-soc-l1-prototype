@@ -17,11 +17,20 @@ class Verdict(BaseModel):
     evidence_ids: list[str] = Field(default_factory=list)
     evidence_for: list[EvidenceClaim] = Field(default_factory=list)
     evidence_against: list[EvidenceClaim] = Field(default_factory=list)
+    related_event_ids: list[str] = Field(default_factory=list)
+    mitre_techniques: list[str] = Field(default_factory=list)
     missing_data: list[str] = Field(default_factory=list)
     recommended_actions: list[str] = Field(default_factory=list)
     auto_close_eligible: bool = False
+    model_auto_close_candidate: bool | None = None
+    model_classification: Classification | None = None
+    model_confidence: float | None = Field(default=None, ge=0, le=1)
+    model_name: str | None = None
+    model_digest: str | None = None
+    prompt_version: str | None = None
+    prompt_sha256: str | None = None
 
-    @field_validator("confidence", mode="before")
+    @field_validator("confidence", "model_confidence", mode="before")
     @classmethod
     def numeric_confidence(cls, value: object) -> object:
         if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):

@@ -186,11 +186,17 @@ def _integration(db: Session, tenant_id: str, name: str, status: str, detail: st
     if not row:
         row = IntegrationState(tenant_id=tenant_id, name=name)
         db.add(row)
+    now = utcnow()
     row.status = status
     row.detail = detail[:500]
-    row.last_checked_at = utcnow()
+    row.last_checked_at = now
+    if status == "healthy":
+        row.last_success_at = now
+    if status in {"unavailable", "degraded"}:
+        row.last_error_at = now
+        row.last_error = detail[:100] or status
     if received:
-        row.last_received_at = utcnow()
+        row.last_received_at = now
     if status == "unavailable":
         audit(db, tenant_id, "integration", "integration_error", "integration", name,
               {"error_type": detail[:100]})
@@ -331,6 +337,8 @@ def manual_close_gate(db: Session, tenant: Tenant, inv: Investigation, evidence:
         Alert.investigation_id == inv.id).with_for_update()).all()
     if not linked:
         deny("no_alert", "В расследовании нет алерта")
+    if len(linked) != 1:
+        deny("multiple_linked_alerts", "Групповое закрытие нескольких алертов не поддерживается")
     if any(a.status == "escalated" for a in linked):
         deny("escalated", "Эскалированный алерт нельзя закрыть по правилу FP")
     if any(str(a.severity).lower() not in {"low", "medium", "high"} for a in linked) or \
@@ -610,8 +618,11 @@ def _field_digest(value: object) -> str:
 
 def _record_case_fields(case: Case, changes: dict) -> None:
     hashes = dict((case.data or {}).get("remote_field_hashes") or {})
+    values = dict((case.data or {}).get("remote_field_values") or {})
     hashes.update({field: _field_digest(value) for field, value in changes.items()})
-    case.data = {**(case.data or {}), "remote_field_hashes": hashes}
+    values.update(changes)
+    case.data = {**(case.data or {}), "remote_field_hashes": hashes,
+                 "remote_field_values": values}
     if "title" in changes:
         case.title = changes["title"]
 
@@ -918,7 +929,7 @@ def _perform_case_action(db: Session, tenant: Tenant, inv: Investigation, alert:
 
 
 def perform_action(db: Session, tenant: Tenant, inv: Investigation, alert: Alert, kind: str,
-                   evidence: list[Evidence]) -> Action | None:
+                   evidence: list[Evidence], *, automatic: bool = False) -> Action | None:
     if not can_act(tenant, kind):
         return None
     if kind == "close_alert":
@@ -957,6 +968,13 @@ def perform_action(db: Session, tenant: Tenant, inv: Investigation, alert: Alert
         return None
     key = f"{inv.id}:{kind}:{alert.id if kind == 'close_alert' else 'case'}"
     action = db.scalar(select(Action).where(Action.tenant_id == tenant.id, Action.idempotency_key == key))
+    if kind == "close_alert" and db.scalar(select(Action.id).where(
+            Action.tenant_id == tenant.id, Action.investigation_id == inv.id,
+            Action.kind == "close_alert", Action.idempotency_key != key).limit(1)):
+        audit(db, tenant.id, "policy", "action_denied_conflict", "investigation", inv.id,
+              {"kind": kind, "reason": "another_close_exists"})
+        db.commit()
+        return None
     if action and action.status == "succeeded":
         return action
     if kind in {"create_case", "close_alert"}:
@@ -977,6 +995,10 @@ def perform_action(db: Session, tenant: Tenant, inv: Investigation, alert: Alert
             db.flush()
             _case_write_plan(db, tenant, inv, case, action, evidence)
         else:
+            if automatic:
+                db.flush()
+                audit(db, tenant.id, "policy", "auto_close_attempted", "action", action.id,
+                      {"alert_id": alert.id})
             db.commit()
     elif action.status == "pending":
         if action.attempted_at and utcnow() - aware(action.attempted_at) < timedelta(minutes=2):
@@ -1112,12 +1134,21 @@ def process_alert(db: Session, alert_id: str) -> None:
             steps.append({"step": "time_budget", "status": "limited"})
     if analyzer in {"local_model", "external_model"} and decision.classification != baseline.classification:
         from .playbooks import Verdict
+        proposed = decision
         decision = Verdict(verdict="needs_review", priority=baseline.priority,
                            summary="Требуется ручная проверка расхождения",
                            rationale="Классификация модели не совпала с проверяемым правилом плейбука; автоматическое действие запрещено.",
                            evidence_ids=[e.id for e in evidence],
                            missing_data=["Проверить причину расхождения модели и плейбука"],
-                           recommended_actions=["review"])
+                           recommended_actions=["review"],
+                           related_event_ids=proposed.related_event_ids,
+                           mitre_techniques=proposed.mitre_techniques,
+                           model_auto_close_candidate=proposed.model_auto_close_candidate,
+                           model_classification=proposed.model_classification,
+                           model_confidence=proposed.model_confidence,
+                           model_name=proposed.model_name, model_digest=proposed.model_digest,
+                           prompt_version=proposed.prompt_version,
+                           prompt_sha256=proposed.prompt_sha256)
         steps.append({"step": "model_disagreement", "status": "needs_review"})
     known_ids = {e.id for e in evidence}
     claim_ids = {claim.evidence_id for claim in decision.evidence_for + decision.evidence_against}
@@ -1140,15 +1171,25 @@ def process_alert(db: Session, alert_id: str) -> None:
                     evidence_ids=decision.evidence_ids,
                     evidence_for=[claim.model_dump() for claim in decision.evidence_for],
                     evidence_against=[claim.model_dump() for claim in decision.evidence_against],
+                    related_event_ids=decision.related_event_ids,
+                    mitre_techniques=decision.mitre_techniques,
                     missing_data=decision.missing_data,
-                    recommended_actions=decision.recommended_actions, actor=analyzer))
+                    recommended_actions=decision.recommended_actions,
+                    model_auto_close_candidate=decision.model_auto_close_candidate,
+                    model_classification=decision.model_classification,
+                    model_confidence=decision.model_confidence,
+                    model_name=decision.model_name, model_digest=decision.model_digest,
+                    prompt_version=decision.prompt_version, prompt_sha256=decision.prompt_sha256,
+                    actor=analyzer))
     move_alert(db, alert, PipelineState.TRIAGED, "worker", "decision_persisted")
     audit(db, tenant.id, analyzer, "decision", "investigation", inv.id,
-          {"classification": decision.classification, "verdict": decision.verdict, "playbook": playbook.key})
+          {"classification": decision.classification, "verdict": decision.verdict,
+           "playbook": playbook.key, "model_name": decision.model_name,
+           "prompt_version": decision.prompt_version})
     db.commit()
     if decision.classification == "FP" and decision.auto_close_eligible:
         if settings().auto_close_enabled:
-            action = perform_action(db, tenant, inv, alert, "close_alert", evidence)
+            action = perform_action(db, tenant, inv, alert, "close_alert", evidence, automatic=True)
             status = "auto_closed" if action and action.status == "succeeded" else "needs_review"
             if not action:
                 audit(db, tenant.id, "policy", "auto_close_denied", "investigation", inv.id,

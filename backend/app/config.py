@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     thehive_base_url: str = ""
     thehive_api_key: str = ""
     thehive_api_version: str = ""
+    thehive_case_url_template: str = ""
     misp_base_url: str = ""
     misp_api_key: str = ""
     ollama_base_url: str = ""

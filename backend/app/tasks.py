@@ -2,13 +2,14 @@ from datetime import timedelta
 from hashlib import sha256
 import json
 from celery import Celery
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from .adapters import splunk_adapter, thehive_adapter, misp_adapter
+from .analyzer import ollama_health
 from .config import settings
 from .db import SessionLocal
 from .ingestion import normalize_alert
-from .models import (Alert, Checkpoint, DeadLetter, IngestionQuarantine, IntegrationState,
+from .models import (Alert, Audit, Checkpoint, DeadLetter, IngestionQuarantine, IntegrationState,
                      Investigation, MispNotice, PlaybookRun, Tenant, utcnow)
 from .observability import log_event
 from .security import audit, validate_runtime_secrets
@@ -25,6 +26,51 @@ celery_app.conf.update(task_serializer="json", accept_content=["json"], result_s
                            "health": {"task": "soc.check_integrations", "schedule": 120.0},
                        })
 validate_runtime_secrets(settings().mode, settings().jwt_secret, settings().webhook_secret)
+
+
+_TERMINAL_STATUS = {
+    PipelineState.CASE_CREATED: "escalated",
+    PipelineState.CLOSED_FP: "auto_closed",
+    PipelineState.SUPPRESSED: "suppressed",
+    PipelineState.FAILED_PERMANENT: "failed",
+}
+
+
+def _repair_terminal_alert(db, alert: Alert) -> bool:
+    """Keep a committed terminal action terminal after a worker interruption."""
+    expected = _TERMINAL_STATUS.get(alert.pipeline_state)
+    if expected is None:
+        return False
+    if alert.pipeline_state == PipelineState.CLOSED_FP:
+        manual = db.scalar(select(Audit.id).where(
+            Audit.tenant_id == alert.tenant_id,
+            Audit.subject_type == "investigation",
+            Audit.subject_id == alert.investigation_id,
+            Audit.operation == "manual_close_granted").limit(1))
+        if manual:
+            expected = "closed"
+        elif alert.status == "closed":
+            # Preserve an already final human-initiated outcome.
+            expected = "closed"
+    inv = db.scalar(select(Investigation).where(
+        Investigation.id == alert.investigation_id,
+        Investigation.tenant_id == alert.tenant_id))
+    changed = alert.status != expected or alert.claimed_at is not None
+    if inv:
+        changed = changed or inv.status != expected or inv.claimed_at is not None
+    if not changed:
+        return False
+    alert.status = expected
+    alert.claimed_at = None
+    alert.processed_at = alert.processed_at or utcnow()
+    if inv:
+        inv.status = expected
+        inv.claimed_at = None
+        if alert.pipeline_state != PipelineState.FAILED_PERMANENT:
+            inv.completed_at = inv.completed_at or utcnow()
+    audit(db, alert.tenant_id, "worker", "terminal_state_reconciled", "alert", alert.id,
+          {"pipeline_state": alert.pipeline_state, "status": expected})
+    return True
 
 
 def dispatch(alert_id: str) -> bool:
@@ -51,9 +97,16 @@ def process_alert_task(self, alert_id: str) -> None:
             log_event("alert_processed", event_id=alert_id)
         except Exception as exc:
             db.rollback()
+            alert = db.get(Alert, alert_id)
+            if alert and alert.pipeline_state in _TERMINAL_STATUS:
+                _repair_terminal_alert(db, alert)
+                db.commit()
+                log_event("alert_terminal_recovered", event_id=alert_id,
+                          tenant_id=alert.tenant_id, status=alert.status,
+                          error_type=type(exc).__name__)
+                return
             if self.request.retries < self.max_retries:
                 log_event("alert_retryable_error", event_id=alert_id, error_type=type(exc).__name__)
-                alert = db.get(Alert, alert_id)
                 if alert:
                     if alert.pipeline_state not in {PipelineState.CASE_CREATED, PipelineState.CLOSED_FP,
                                                     PipelineState.SUPPRESSED, PipelineState.FAILED_PERMANENT}:
@@ -99,7 +152,22 @@ def recover() -> int:
     queued_cutoff = utcnow() - timedelta(minutes=5)
     running_cutoff = utcnow() - timedelta(minutes=2)
     with SessionLocal() as db:
+        terminal_mismatch = or_(
+            and_(Alert.pipeline_state == PipelineState.CASE_CREATED,
+                 Alert.status != "escalated"),
+            and_(Alert.pipeline_state == PipelineState.CLOSED_FP,
+                 Alert.status.notin_(("auto_closed", "closed"))),
+            and_(Alert.pipeline_state == PipelineState.SUPPRESSED,
+                 Alert.status != "suppressed"),
+            and_(Alert.pipeline_state == PipelineState.FAILED_PERMANENT,
+                 Alert.status != "failed"),
+        )
+        terminal = db.scalars(select(Alert).where(terminal_mismatch)
+                              .limit(200).with_for_update()).all()
+        for alert in terminal:
+            _repair_terminal_alert(db, alert)
         alerts = db.scalars(select(Alert).where(
+            Alert.pipeline_state.notin_(_TERMINAL_STATUS),
             ((Alert.status == "queued") & ((Alert.last_dispatched_at.is_(None)) | (Alert.last_dispatched_at < queued_cutoff))) |
             ((Alert.status == "running") & ((Alert.claimed_at.is_(None)) | (Alert.claimed_at < running_cutoff)))
         ).limit(200)).all()
@@ -270,11 +338,38 @@ def poll_splunk() -> int:
 def check_integrations() -> None:
     with SessionLocal() as db:
         for tenant in db.scalars(select(Tenant)).all():
+            db.execute(text("SELECT 1"))
+            dialect = db.get_bind().dialect.name
+            database_status = "healthy" if (settings().mode.upper() == "DEMO" or dialect == "postgresql") else "unavailable"
+            database_detail = "SQLite DEMO" if settings().mode.upper() == "DEMO" else (
+                "PostgreSQL отвечает" if database_status == "healthy" else "CONNECTED требует PostgreSQL")
+            _integration(db, tenant.id, "database", database_status, database_detail)
+            if settings().mode.upper() == "DEMO":
+                _integration(db, tenant.id, "redis", "not_applicable", "DEMO использует Celery eager")
+                _integration(db, tenant.id, "worker", "not_applicable", "DEMO выполняет задачи в процессе API")
+            else:
+                import redis
+
+                try:
+                    redis.Redis.from_url(settings().redis_url, socket_connect_timeout=2, socket_timeout=2).ping()
+                    _integration(db, tenant.id, "redis", "healthy", "Redis отвечает")
+                except redis.RedisError as exc:
+                    _integration(db, tenant.id, "redis", "unavailable", type(exc).__name__)
+            if settings().ollama_base_url or settings().ollama_model:
+                try:
+                    model = ollama_health()
+                    _integration(db, tenant.id, "ollama", "healthy",
+                                 f"{model['model']}, prompt {model['prompt_version']}")
+                except Exception as exc:
+                    _integration(db, tenant.id, "ollama", "unavailable", type(exc).__name__)
+            else:
+                _integration(db, tenant.id, "ollama", "not_configured", "Локальная модель не настроена")
             for name, factory in (("splunk", splunk_adapter), ("thehive", thehive_adapter), ("misp", misp_adapter)):
                 try:
                     adapter = factory()
                     adapter.health()
-                    _integration(db, tenant.id, name, "healthy")
+                    version = getattr(adapter, "_verified_version", None) if name == "thehive" else None
+                    _integration(db, tenant.id, name, "healthy", f"API {version}" if version else "")
                     if name == "misp":
                         for item in adapter.notices()[:20]:
                             event = item.get("Event", item)

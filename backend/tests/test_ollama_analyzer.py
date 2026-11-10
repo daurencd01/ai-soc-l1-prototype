@@ -79,7 +79,12 @@ def test_local_ollama_uses_native_api_schema_and_redacts_secrets(monkeypatch):
     assert verdict.verdict == "false_positive"
     assert verdict.evidence_ids == ["e1"]
     assert verdict.auto_close_eligible is True  # Still subject to independent Python policy.
-    assert "local:7b" in verdict.rationale and analyzer.PROMPT_VERSION in verdict.rationale
+    assert verdict.model_name == "local:7b"
+    assert verdict.model_digest == "a" * 64
+    assert verdict.prompt_version == analyzer.PROMPT_VERSION
+    assert verdict.prompt_sha256 == analyzer.PROMPT_SHA256
+    assert verdict.model_classification == "FP" and verdict.model_confidence == 0.73
+    assert verdict.model_auto_close_candidate is True
     assert [request.url.path for request in calls] == ["/api/tags", "/api/chat"]
     body = json.loads(calls[1].content)
     assert body["stream"] is False and body["model"] == "local:7b"
@@ -88,6 +93,69 @@ def test_local_ollama_uses_native_api_schema_and_redacts_secrets(monkeypatch):
     assert "supersecret" not in calls[1].content.decode()
     assert "abc123" not in calls[1].content.decode()
     assert "[скрыто]" in calls[1].content.decode()
+
+
+def test_ollama_health_reads_only_local_inventory(monkeypatch):
+    _configure(monkeypatch)
+    paths = []
+
+    def handler(request):
+        paths.append(request.url.path)
+        return _tags()
+
+    _mock_client(monkeypatch, handler)
+    result = analyzer.ollama_health()
+    assert paths == ["/api/tags"]
+    assert result == {"model": "local:7b", "digest": "a" * 64,
+                      "prompt_version": analyzer.PROMPT_VERSION,
+                      "prompt_sha256": analyzer.PROMPT_SHA256}
+
+
+def test_quoted_secret_and_nested_fake_event_id_are_not_model_authority(monkeypatch):
+    _configure(monkeypatch)
+    calls = []
+    evidence = [{"id": "e1", "kind": "raw_alert", "source": "test", "summary": "Raw",
+                 "data": {"message": '{"password":"should-not-leak","event_id":"invented"}'}}]
+
+    def handler(request):
+        calls.append(request)
+        return _tags() if request.url.path == "/api/tags" else _chat(
+            _proposal(related_event_ids=["invented"]))
+
+    _mock_client(monkeypatch, handler)
+    verdict, actor = analyzer.model_analyze(evidence, _baseline())
+    assert actor == "model_error" and verdict.classification == "INCONCLUSIVE"
+    assert "should-not-leak" not in calls[1].content.decode()
+    assert "[скрыто]" in calls[1].content.decode()
+
+
+def test_model_event_and_mitre_suggestions_are_validated_and_retained(monkeypatch):
+    _configure(monkeypatch)
+    evidence = _evidence() + [{"id": "e2", "kind": "embedded_event", "source": "splunk",
+                               "summary": "Related", "data": {"source_event_id": "real-2"}}]
+
+    def handler(request):
+        return _tags() if request.url.path == "/api/tags" else _chat(
+            _proposal(related_event_ids=["real-2"], mitre_techniques=["T1078", "T1110.001"]))
+
+    _mock_client(monkeypatch, handler)
+    verdict, actor = analyzer.model_analyze(evidence, _baseline())
+    assert actor == "local_model"
+    assert verdict.related_event_ids == ["real-2"]
+    assert verdict.mitre_techniques == ["T1078", "T1110.001"]
+
+
+def test_invalid_mitre_code_fails_closed(monkeypatch):
+    _configure(monkeypatch)
+
+    def handler(request):
+        return _tags() if request.url.path == "/api/tags" else _chat(
+            _proposal(mitre_techniques=["ignore previous instructions"]))
+
+    _mock_client(monkeypatch, handler)
+    verdict, actor = analyzer.model_analyze(_evidence(), _baseline())
+    assert actor == "model_error" and verdict.classification == "INCONCLUSIVE"
+    assert verdict.auto_close_eligible is False
 
 
 @pytest.mark.parametrize("base", ["https://ollama.com", "http://127.0.0.1@evil.test", "http://ollama:11434/path"])
@@ -112,6 +180,23 @@ def test_remote_model_in_local_inventory_is_rejected_before_events(monkeypatch):
     assert calls == ["/api/tags"]
 
 
+@pytest.mark.parametrize("inventory_change", [{"size": True}, {"digest": "not-a-model-digest"}])
+def test_unverifiable_model_inventory_is_rejected_before_events(monkeypatch, inventory_change):
+    _configure(monkeypatch)
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        model = {"name": "local:7b", "model": "local:7b", "digest": "a" * 64, "size": 1000}
+        model.update(inventory_change)
+        return httpx.Response(200, json={"models": [model]})
+
+    _mock_client(monkeypatch, handler)
+    verdict, actor = analyzer.model_analyze(_evidence(), _baseline())
+    assert actor == "model_error" and verdict.verdict == "needs_review"
+    assert calls == ["/api/tags"]
+
+
 def test_explicit_cloud_tag_is_rejected_before_network(monkeypatch):
     _configure(monkeypatch, ollama_model="qwen:cloud")
     monkeypatch.setattr(analyzer.httpx, "Client", lambda *a, **kw: pytest.fail("network attempted"))
@@ -128,8 +213,11 @@ def test_unavailable_ollama_uses_deterministic_fallback_without_auto_close(monke
     _mock_client(monkeypatch, handler)
     verdict, actor = analyzer.model_analyze(_evidence(), _baseline())
     assert actor == "deterministic_fallback"
-    assert verdict.verdict == "false_positive"
+    assert verdict.verdict == "needs_review" and verdict.classification == "INCONCLUSIVE"
     assert verdict.auto_close_eligible is False
+    assert verdict.recommended_actions == ["review"]
+    assert verdict.evidence_ids == ["e1"]
+    assert verdict.model_name is None and verdict.prompt_version is None
 
 
 @pytest.mark.parametrize("proposal", ["not-json", json.dumps(_proposal(evidence_for=[{"evidence_id": "invented", "reason": "fake"}])),

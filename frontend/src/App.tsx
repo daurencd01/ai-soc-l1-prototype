@@ -7,6 +7,7 @@ type Flash = { kind: 'success' | 'error'; text: string } | null
 const navigation: NavItem[] = [
   { path: '/', label: 'Обзор', group: 'Работа' },
   { path: '/alerts', label: 'Алерты', group: 'Работа' },
+  { path: '/cases', label: 'Кейсы', group: 'Работа' },
   { path: '/scenarios', label: 'Сценарии DEMO', group: 'Работа' },
   { path: '/contexts', label: 'Исключения и работы', group: 'Контроль' },
   { path: '/suppression', label: 'Подавление шума', group: 'Контроль' },
@@ -42,7 +43,7 @@ function statusLabel(value: unknown): string {
   const labels: Record<string, string> = {
     new: 'Новый', received: 'Получен', queued: 'В очереди', running: 'В работе', processing: 'В работе', investigating: 'Расследуется',
     completed: 'Завершён', closed: 'Закрыт', auto_closed: 'Автозакрыт', escalated: 'Эскалирован', reported: 'Отчёт утверждён', retried: 'Повторена', failed: 'Ошибка', pending: 'Ожидает',
-    succeeded: 'Выполнено', unknown: 'Неизвестно', healthy: 'Доступно', degraded: 'Сбой', unavailable: 'Недоступно', stale: 'Нет сигнала',
+    succeeded: 'Выполнено', confirmed: 'Подтверждено', unknown: 'Неизвестно', healthy: 'Доступно', degraded: 'Сбой', unavailable: 'Недоступно', stale: 'Нет сигнала', not_configured: 'Не настроено', not_applicable: 'Не применяется', denied: 'Отказано', attempted: 'Попытка', requested: 'Запрошено', recorded: 'Записано в аудит',
     true_positive: 'Подтверждено', false_positive: 'Ложное срабатывание', needs_review: 'Нужна проверка',
     tp: 'Инцидент', fp: 'Ложное срабатывание', benign_true_positive: 'Разрешённая активность', noise: 'Шум', inconclusive: 'Недостаточно данных',
     validated: 'Проверен', enriching: 'Сбор данных', triaging: 'Классификация', triaged: 'Классифицирован',
@@ -60,8 +61,8 @@ function statusLabel(value: unknown): string {
 
 function toneFor(value: unknown): string {
   const key = valueText(value, '').toLowerCase()
-  if (['critical', 'high', 'true_positive', 'tp', 'failed', 'failed_permanent', 'unavailable', 'stale', 'overdue', 'error', 'expired'].includes(key)) return 'danger'
-  if (['needs_review', 'inconclusive', 'medium', 'pending', 'failed_retryable', 'degraded', 'unknown', 'processing', 'investigating', 'running', 'queued', 'draft'].includes(key)) return 'warning'
+  if (['critical', 'high', 'true_positive', 'tp', 'failed', 'failed_permanent', 'unavailable', 'stale', 'overdue', 'error', 'expired', 'denied'].includes(key)) return 'danger'
+  if (['needs_review', 'inconclusive', 'medium', 'pending', 'failed_retryable', 'degraded', 'unknown', 'processing', 'investigating', 'running', 'queued', 'draft', 'attempted', 'requested'].includes(key)) return 'warning'
   if (['false_positive', 'fp', 'completed', 'closed', 'resolved', 'auto_closed', 'closed_fp', 'succeeded', 'healthy', 'approved', 'active', 'reported'].includes(key)) return 'success'
   return 'neutral'
 }
@@ -77,10 +78,12 @@ function confidenceText(value: unknown): string {
     ? `${Math.round(value * 100)}% · оценка модели` : 'Не указана'
 }
 
-function integrationName(value: unknown): string {
+function integrationName(value: unknown, mode?: unknown): string {
   const names: Record<string, string> = {
     splunk: 'Splunk · поступление логов', thehive: 'TheHive · кейсы',
-    misp: 'MISP · уведомления', worker: 'Worker · фоновая обработка',
+    misp: 'MISP · уведомления', ollama: 'Ollama · локальная LLM',
+    database: valueText(mode).toUpperCase() === 'DEMO' ? 'SQLite · база DEMO' : 'PostgreSQL · база данных', postgresql: 'PostgreSQL', redis: 'Redis · очередь',
+    worker: 'Worker · фоновая обработка',
   }
   const name = valueText(value, 'Источник')
   return names[name] ?? name
@@ -89,7 +92,8 @@ function integrationName(value: unknown): string {
 function integrationDetail(item: JsonRecord, mode: unknown): string {
   const detail = valueText(item.detail, '')
   if (detail) return detail
-  if (item.status === 'healthy') return mode === 'DEMO' ? 'Демонстрационный адаптер доступен' : 'Проверка API успешна'
+  if (item.status === 'healthy') return valueText(mode).toUpperCase() === 'DEMO' && ['splunk', 'thehive', 'misp'].includes(valueText(item.name))
+    ? 'Демонстрационный адаптер доступен' : 'Проверка доступности успешна'
   if (item.status === 'unknown') return 'Проверка ещё не выполнялась'
   return 'Подробности не получены'
 }
@@ -242,7 +246,14 @@ function Dashboard({ user }: { user: JsonRecord }) {
   const alerts = records(recent.data)
   const integrations = records(info.integrations)
   const mode = valueText(user.mode, '').toLowerCase()
+  const automatedRate = typeof info.automated_handling_rate === 'number' && Number.isFinite(info.automated_handling_rate)
+    ? `${Math.round(info.automated_handling_rate * 100)}%` : '—'
   const metrics = [
+    { label: 'Всего алертов', value: info.alerts_total, caption: 'принятых записей' },
+    { label: 'Кейсы TheHive', value: info.cases_created_total, caption: mode === 'demo' ? 'симулированно созданы' : 'подтверждены записью' },
+    { label: 'Повторные доставки', value: info.deduplicated_total, caption: 'не создали новый алерт' },
+    { label: 'Без ручного вмешательства', value: automatedRate, caption: automatedRate === '—' ? 'нет завершённых данных' : 'доля завершённых расследований' },
+    { label: 'Ошибки интеграций', value: info.integration_errors_total, caption: 'записаны в аудите' },
     { label: 'В очереди', value: counts.queued, caption: 'ожидают обработки' },
     { label: 'Расследуются', value: counts.running, caption: 'активные расследования' },
     { label: 'Нужна проверка', value: counts.needs_review, caption: 'решение аналитика' },
@@ -256,7 +267,7 @@ function Dashboard({ user }: { user: JsonRecord }) {
       <div className="metric-grid">{metrics.map(metric => <div className="metric" key={metric.label}><div className="metric__label">{metric.label}</div><div className="metric__value">{valueText(metric.value)}</div><div className="metric__caption">{metric.value === undefined ? 'Данные недоступны' : metric.caption}</div></div>)}</div>
       <Panel title="Классификации решений" aside={user.role === 'admin' ? <Link to="/metrics" className="inline-link">Все метрики</Link> : undefined}><div className="classification-summary">{classifications.map(key => <div key={key}><Badge value={key} /><strong>{valueText(asRecord(info.classification_counts)[key], '0')}</strong></div>)}</div><p className="field__hint">Подсчёт по сохранённым решениям, включая повторные решения одного расследования.</p></Panel>
       <div className="dashboard-grid"><Panel title="Недавние алерты" aside={<Link to="/alerts" className="inline-link">Вся очередь</Link>}>{alerts.length ? <div className="stack-list">{alerts.map((item, index) => <AlertRow key={valueText(item.id, String(index))} item={item} />)}</div> : <Empty title="Алертов пока нет" detail="Проверьте поступление логов и состояние интеграций. Пустая очередь сама по себе не подтверждает исправность мониторинга." />}</Panel>
-        <div className="dashboard-side"><Panel title="Состояние источников" aside={<Link to="/integrations" className="inline-link">Интеграции</Link>}>{integrations.length ? <div className="health-list">{integrations.map((item, index) => <div className="health-row" key={valueText(item.name, String(index))}><div><strong>{integrationName(item.name)}</strong><small>{item.name === 'worker' ? 'Последний сигнал' : 'Последний лог'}: {dateText(item.name === 'worker' ? item.last_checked_at : item.last_received_at)}</small></div><Badge value={item.status} /></div>)}</div> : <Empty title="Состояние неизвестно" detail="Источники ещё не сообщили о доступности и времени последнего лога." />}</Panel><Panel title="Продолжить работу"><div className="quick-links"><Link to="/sla">Проверить сроки обработки <span>→</span></Link><Link to="/dead-letters">Разобрать ошибочные задачи <span>→</span></Link><Link to="/shifts">Подготовить передачу смены <span>→</span></Link></div></Panel></div></div>
+        <div className="dashboard-side"><Panel title="Состояние источников" aside={<Link to="/integrations" className="inline-link">Интеграции</Link>}>{integrations.length ? <div className="health-list">{integrations.map((item, index) => <div className="health-row" key={valueText(item.name, String(index))}><div><strong>{integrationName(item.name, user.mode)}</strong><small>{item.name === 'worker' && item.status !== 'not_applicable' ? 'Последний сигнал' : 'Последняя проверка'}: {dateText(item.last_checked_at)}</small></div><Badge value={item.status} /></div>)}</div> : <Empty title="Состояние неизвестно" detail="Источники ещё не сообщили о доступности и времени последнего лога." />}</Panel><Panel title="Продолжить работу"><div className="quick-links"><Link to="/sla">Проверить сроки обработки <span>→</span></Link><Link to="/dead-letters">Разобрать ошибочные задачи <span>→</span></Link><Link to="/shifts">Подготовить передачу смены <span>→</span></Link></div></Panel></div></div>
     </>}</>
 }
 
@@ -276,6 +287,7 @@ function Metrics() {
     <div className="metric-grid">{counters.map(([label, value]) => <div className="metric" key={label}><div className="metric__label">{label}</div><div className="metric__value">{valueText(value, '—')}</div></div>)}</div>
     <Panel title="Результаты классификации"><div className="classification-summary">{classifications.map(key => <div key={key}><Badge value={key} /><strong>{valueText(triage[key], '0')}</strong></div>)}</div><p className="field__hint">Подсчёт по решениям, а не по уникальным алертам.</p></Panel>
     <Panel title="Время обработки"><Meta entries={[{ label: 'Завершённых расследований', value: valueText(duration.count, '0') }, { label: 'Среднее', value: typeof duration.avg === 'number' ? `${duration.avg.toFixed(1)} с` : 'Недостаточно данных' }, { label: 'Суммарное', value: typeof duration.sum === 'number' ? `${duration.sum.toFixed(1)} с` : 'Недостаточно данных' }]} /></Panel>
+    <Panel title="Доля без ручного вмешательства"><Meta entries={[{ label: 'Доля завершённых расследований', value: typeof values.automated_handling_rate === 'number' ? `${Math.round(values.automated_handling_rate * 100)}%` : 'Нет завершённых расследований' }, { label: 'Завершено автоматически', value: valueText(values.automated_handling_total, '—') }, { label: 'Всего завершено', value: valueText(values.processed_investigations_total, '—') }]} /><p className="field__hint">Учитываются завершённые расследования без сохранённого ручного решения или запрошенного аналитиком действия.</p></Panel>
   </>}</>
 }
 
@@ -291,6 +303,7 @@ function Alerts({ user }: { user: JsonRecord }) {
   const [verdict, setVerdict] = useState('')
   const [classification, setClassification] = useState('')
   const [search, setSearch] = useState('')
+  const [sortKey, setSortKey] = useState('newest')
   const [query, setQuery] = useState('')
   const [file, setFile] = useState<File | null>(null)
   const [uploadKey, setUploadKey] = useState(0)
@@ -300,6 +313,16 @@ function Alerts({ user }: { user: JsonRecord }) {
   const path = `/alerts${query ? `?${query}` : ''}`
   const { data, loading, error, reload } = useResource(path, 15000)
   const list = records(data)
+  const sortedList = [...list].sort((a, b) => {
+    if (sortKey === 'oldest') return (dateValue(a.received_at) ?? 0) - (dateValue(b.received_at) ?? 0)
+    if (sortKey === 'severity') {
+      const rank: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 }
+      return (rank[valueText(b.severity).toLowerCase()] ?? 0) - (rank[valueText(a.severity).toLowerCase()] ?? 0)
+    }
+    if (sortKey === 'confidence') return (typeof b.confidence === 'number' ? b.confidence : -1) - (typeof a.confidence === 'number' ? a.confidence : -1)
+    if (sortKey === 'title') return valueText(a.title, '').localeCompare(valueText(b.title, ''), 'ru')
+    return (dateValue(b.received_at) ?? 0) - (dateValue(a.received_at) ?? 0)
+  })
   const apply = (event: FormEvent) => {
     event.preventDefault()
     const params = new URLSearchParams()
@@ -323,13 +346,53 @@ function Alerts({ user }: { user: JsonRecord }) {
     if (ok) { setFile(null); setUploadKey(value => value + 1) }
   }
   return <><PageHead title="Алерты" description="Исходные алерты сохраняются отдельно от расследований и вложенных событий." actions={<button className="button button--secondary" onClick={reload}>Обновить</button>} />
-    <Panel className="filter-panel"><form className="filters" onSubmit={apply}><Field label="Поиск по названию"><input placeholder="Название алерта" value={search} onChange={event => setSearch(event.target.value)} /></Field><Field label="Статус"><select value={status} onChange={event => setStatus(event.target.value)}><option value="">Все статусы</option><option value="queued">В очереди</option><option value="running">В работе</option><option value="needs_review">Нужна проверка</option><option value="auto_closed">Автозакрыт</option><option value="escalated">Эскалирован</option><option value="failed">Ошибка</option></select></Field><Field label="Классификация"><select value={classification} onChange={event => setClassification(event.target.value)}><option value="">Все классификации</option>{classifications.map(key => <option key={key} value={key}>{statusLabel(key)}</option>)}</select></Field><Field label="Маршрут действий"><select value={verdict} onChange={event => setVerdict(event.target.value)}><option value="">Все маршруты</option><option value="true_positive">Инцидент</option><option value="false_positive">FP</option><option value="needs_review">Ручная проверка</option></select></Field><button className="button button--primary" type="submit">Применить</button></form></Panel>
+    <Panel className="filter-panel"><form className="filters" onSubmit={apply}><Field label="Поиск по названию"><input placeholder="Название алерта" value={search} onChange={event => setSearch(event.target.value)} /></Field><Field label="Статус"><select value={status} onChange={event => setStatus(event.target.value)}><option value="">Все статусы</option><option value="queued">В очереди</option><option value="running">В работе</option><option value="needs_review">Нужна проверка</option><option value="auto_closed">Автозакрыт</option><option value="closed">Закрыт</option><option value="escalated">Эскалирован</option><option value="failed">Ошибка</option></select></Field><Field label="Классификация"><select value={classification} onChange={event => setClassification(event.target.value)}><option value="">Все классификации</option>{classifications.map(key => <option key={key} value={key}>{statusLabel(key)}</option>)}</select></Field><Field label="Маршрут действий"><select value={verdict} onChange={event => setVerdict(event.target.value)}><option value="">Все маршруты</option><option value="true_positive">Инцидент</option><option value="false_positive">FP</option><option value="needs_review">Ручная проверка</option></select></Field><Field label="Сортировка показанных"><select value={sortKey} onChange={event => setSortKey(event.target.value)}><option value="newest">Новые сначала</option><option value="oldest">Старые сначала</option><option value="severity">Критичные сначала</option><option value="confidence">По уверенности</option><option value="title">По названию</option></select></Field><button className="button button--primary" type="submit">Применить</button></form></Panel>
     {admin && <Panel title="Импорт алертов"><form className="import-form" onSubmit={submitImport}><Field label="JSON или CSV, не более 2 МБ"><input key={uploadKey} type="file" accept=".json,.csv,application/json,text/csv" required onChange={event => setFile(event.target.files?.[0] ?? null)} /></Field><button className="button button--secondary" disabled={!file || upload.busy}>{upload.busy ? 'Импорт…' : 'Импортировать'}</button></form><Notice flash={upload.flash} />{uploadResult && <p className="panel-intro">Новых алертов: {valueText(uploadResult.created_count)}.</p>}</Panel>}
-    {error && <ErrorState message={error} retry={reload} />}{loading && !data ? <Loading /> : <Panel title="Список алертов" aside={<span className="quiet">{list.length} записей</span>}>{list.length ? <div className="table-wrap"><table><thead><tr><th>Алерт</th><th>Заказчик / источник</th><th>Критичность</th><th>Поступил</th><th>Состояние конвейера</th><th>Обработка</th><th>Классификация</th><th>Уверенность</th><th></th></tr></thead><tbody>{list.map((item, index) => {
+    {error && <ErrorState message={error} retry={reload} />}{loading && !data ? <Loading /> : <Panel className="alert-list-panel" title="Список алертов" aside={<span className="quiet">{list.length} показано · сортировка списка</span>}>{list.length ? <div className="table-wrap"><table><thead><tr><th>Алерт</th><th>Заказчик / источник</th><th>Критичность</th><th>Поступил</th><th>Состояние конвейера</th><th>Обработка</th><th>Классификация</th><th>Причина решения</th><th>Уверенность</th><th>Кейс TheHive</th><th></th></tr></thead><tbody>{sortedList.map((item, index) => {
       const id = valueText(item.id, String(index))
       const investigationId = valueText(item.investigation_id, '')
-      return <tr key={id}><td><strong>{valueText(item.title, 'Без названия')}</strong><small className="cell-sub">{valueText(item.source_event_id)}</small></td><td>{valueText(user.tenant_name)}<small className="cell-sub">{valueText(item.source)}</small></td><td><Badge value={item.severity} /></td><td className="number">{dateText(item.received_at)}</td><td><Badge value={item.pipeline_state} /></td><td><Badge value={item.status} /></td><td>{item.classification ? <Badge value={item.classification} /> : '—'}</td><td>{confidenceText(item.confidence)}</td><td>{investigationId && <Link className="inline-link" to={`/investigations/${encodeURIComponent(investigationId)}`}>Открыть</Link>}</td></tr>
+      const sourceUrl = sourceReference(item.source_reference)
+      const caseId = valueText(item.case_id, '')
+      return <tr key={id}><td><strong>{valueText(item.title, 'Без названия')}</strong><small className="cell-sub">{valueText(item.source_event_id)}</small>{sourceUrl && <a className="inline-link cell-link" href={sourceUrl} target="_blank" rel="noopener noreferrer">Исходное событие ↗</a>}</td><td>{valueText(user.tenant_name)}<small className="cell-sub">{valueText(item.source)}</small></td><td><Badge value={item.severity} /></td><td className="number">{dateText(item.received_at)}</td><td><Badge value={item.pipeline_state} /></td><td><Badge value={item.status} /></td><td>{item.classification ? <Badge value={item.classification} /> : '—'}</td><td className="decision-cell">{valueText(item.decision_reason, item.classification ? 'Причина не записана' : 'Решение ожидается')}</td><td>{confidenceText(item.confidence)}</td><td>{caseId ? <><Badge value={item.case_sync_status ?? item.case_status} label={item.case_sync_status ? `Синхронизация: ${statusLabel(item.case_sync_status)}` : `Локально: ${statusLabel(item.case_status)}`} /><small className="cell-sub">{valueText(item.case_external_id, `ID ${caseId}`)}</small><Link className="inline-link cell-link" to="/cases">Открыть кейсы</Link></> : '—'}</td><td>{investigationId && <Link className="inline-link" to={`/investigations/${encodeURIComponent(investigationId)}`}>Открыть</Link>}</td></tr>
     })}</tbody></table></div> : <Empty title="По этому фильтру алертов нет" detail="Измените условия поиска или проверьте приём событий в разделе интеграций." />}</Panel>}</>
+}
+
+function sourceReference(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length > 1000) return null
+  try {
+    const parsed = new URL(value)
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) return null
+    return parsed.href
+  } catch { return null }
+}
+
+function Cases() {
+  const { data, loading, error, reload } = useResource('/cases?limit=100', 15000)
+  const [search, setSearch] = useState('')
+  const [sync, setSync] = useState('')
+  const list = records(data)
+  const shown = list.filter(item => {
+    const matchesSearch = !search.trim() || `${valueText(item.title, '')} ${valueText(item.external_id, '')}`.toLocaleLowerCase('ru').includes(search.trim().toLocaleLowerCase('ru'))
+    return matchesSearch && (!sync || item.sync_status === sync)
+  })
+  return <><PageHead title="Кейсы TheHive" description="Подтверждённые локальные сведения о кейсах и состоянии записи во внешнюю систему." actions={<button className="button button--secondary" onClick={reload}>Обновить</button>} />
+    <Panel className="filter-panel"><div className="filters"><Field label="Поиск среди загруженных кейсов"><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Заголовок или внешний ID" /></Field><Field label="Синхронизация"><select value={sync} onChange={event => setSync(event.target.value)}><option value="">Все состояния</option><option value="confirmed">Подтверждено</option><option value="pending">Ожидает</option><option value="unknown">Неизвестно</option><option value="failed">Ошибка</option></select></Field></div><p className="field__hint">Список ограничен 100 последними кейсами; поиск и фильтр применяются к загруженному списку.</p></Panel>
+    {error ? <ErrorState message={error} retry={reload} /> : loading && !data ? <Loading /> : shown.length ? <div className="case-list">{shown.map((item, index) => {
+      const observableList = records(item.observables)
+      const references = (Array.isArray(item.source_references) ? item.source_references : []).map(sourceReference).filter((url): url is string => !!url)
+      const caseReference = sourceReference(item.case_reference)
+      const investigationId = valueText(item.investigation_id, '')
+      return <article className="panel case-card" key={valueText(item.id, String(index))}>
+        <div className="case-card__head"><div><h2>{valueText(item.title, 'Кейс без заголовка')}</h2><p>{valueText(item.summary, 'Краткое описание не записано')}</p></div><div className="case-card__badges"><Badge value={item.sync_status} label={`Синхронизация: ${statusLabel(item.sync_status)}`} /><Badge value={item.status} /></div></div>
+        <Meta entries={[{ label: 'Внешний ID', value: valueText(item.external_id, 'Не подтверждён') }, { label: 'Критичность', value: <Badge value={item.severity} /> }, { label: 'Классификация', value: item.classification ? <Badge value={item.classification} /> : 'Не указана' }, { label: 'Создан', value: dateText(item.created_at) }, { label: 'Последнее подтверждение записи', value: dateText(item.last_confirmed_at) }]} />
+        {typeof item.handoff_reason === 'string' && item.handoff_reason && <div className="case-card__section"><strong>Основание передачи аналитику</strong><p>{item.handoff_reason}</p></div>}
+        <div className="case-card__section"><strong>Подтверждённые наблюдаемые объекты</strong>{observableList.length ? <ul>{observableList.map((observable, n) => <li key={`${valueText(observable.dataType)}-${valueText(observable.data)}-${n}`}>{valueText(observable.dataType)}: {valueText(observable.data)}</li>)}</ul> : <p>Не записаны или ещё не подтверждены.</p>}</div>
+        <div className="case-card__section"><strong>Ссылки на исходные события</strong>{references.length ? <ul>{references.map(url => <li key={url}><a href={url} target="_blank" rel="noopener noreferrer">{url}</a></li>)}</ul> : <p>Проверенных ссылок нет.</p>}</div>
+        {typeof item.description === 'string' && item.description && <details className="case-facts__details"><summary>Описание кейса{item.description_truncated === true ? ' (показано начало)' : ''}</summary><pre className="evidence-data">{item.description}</pre></details>}
+        <div className="case-card__links">{investigationId && <Link to={`/investigations/${encodeURIComponent(investigationId)}`} className="inline-link">Открыть расследование →</Link>}{caseReference && <a className="inline-link" href={caseReference} target="_blank" rel="noopener noreferrer">Открыть в TheHive ↗</a>}</div>
+      </article>
+    })}</div> : <Empty title="Кейсы не найдены" detail={list.length ? 'Измените поиск или фильтр синхронизации.' : 'Локальных кейсов пока нет. Проверьте расследования и политику создания кейсов.'} />}
+  </>
 }
 
 function CaseStatusControl({ caseId, currentStatus, onUpdated }: { caseId: string; currentStatus: string; onUpdated: () => void }) {
@@ -374,6 +437,32 @@ function CaseStatusControl({ caseId, currentStatus, onUpdated }: { caseId: strin
   </form>
 }
 
+function CaseFacts({ item, writes, classification, rationale, missingData }: {
+  item: JsonRecord; writes: JsonRecord[]; classification: unknown; rationale: unknown; missingData: unknown
+}) {
+  const scoped = writes.filter(write => write.case_id === item.id)
+  const creation = asRecord(scoped.find(write => write.kind === 'create_case')?.request_data)
+  const severity = typeof creation.severity === 'number'
+    ? ({ 1: 'low', 2: 'medium', 3: 'high', 4: 'critical' } as Record<number, string>)[creation.severity] : undefined
+  const observables = scoped.filter(write => write.kind === 'observable' && write.status === 'succeeded')
+    .map(write => asRecord(write.request_data))
+  const metadata = asRecord(item.data)
+  const caseReference = sourceReference(item.case_reference)
+  return <div className="case-facts">
+    <Meta entries={[
+      { label: 'Внешний ID', value: valueText(item.external_id, 'Не подтверждён') },
+      { label: 'Синхронизация', value: item.sync_status ? <Badge value={item.sync_status} /> : 'Не указана' },
+      { label: 'Классификация', value: classification ? <Badge value={classification} /> : 'Не указана' },
+      { label: 'Критичность при создании', value: severity ? <Badge value={severity} /> : 'Не указана' },
+      { label: 'Интервал событий', value: `${dateText(metadata.interval_start)} — ${dateText(metadata.interval_end)}` },
+    ]} />
+    {typeof creation.description === 'string' && creation.description && <details className="case-facts__details"><summary>Описание, отправленное в TheHive</summary><pre className="evidence-data">{creation.description}</pre></details>}
+    <div className="case-facts__section"><strong>Подтверждённые наблюдаемые объекты</strong>{observables.length ? <ul>{observables.map((entry, index) => <li key={`${valueText(entry.dataType)}-${valueText(entry.data)}-${index}`}>{valueText(entry.dataType)}: {valueText(entry.data)}</li>)}</ul> : <p>Нет подтверждённых объектов.</p>}</div>
+    {(rationale || Array.isArray(missingData) && missingData.length > 0) && <div className="case-facts__section"><strong>Основание передачи аналитику</strong><p>{valueText(rationale, 'Обоснование не указано')}</p>{Array.isArray(missingData) && missingData.length > 0 && <small>Недостающие данные: {missingData.map(value => valueText(value)).join(', ')}</small>}</div>}
+    {caseReference && <a className="inline-link case-facts__link" href={caseReference} target="_blank" rel="noopener noreferrer">Открыть кейс в TheHive ↗</a>}
+  </div>
+}
+
 function EvidenceClaims({ title, claims }: { title: string; claims: JsonRecord[] }) {
   return <div className="claim-group"><h3>{title}</h3>{claims.length ? <ul>{claims.map((claim, index) => <li key={`${valueText(claim.evidence_id, String(index))}-${index}`}><strong>ID {valueText(claim.evidence_id)}</strong><span>{valueText(claim.reason, 'Основание не указано')}</span></li>)}</ul> : <p>Не указаны</p>}</div>
 }
@@ -406,6 +495,18 @@ function Investigation({ id, user }: { id: string; user: JsonRecord }) {
   const inv = asRecord(data)
   const alerts = records(inv.alerts)
   const alert = alerts[0] ?? {}
+  const normalized = asRecord(alert.normalized)
+  const normalizedEntries = ([
+    ['event_id', 'ID события'], ['source', 'Источник'], ['rule_id', 'ID правила'], ['rule_name', 'Имя правила'],
+    ['event_time', 'Время события'], ['ingestion_time', 'Время приёма'], ['severity', 'Критичность'],
+    ['host', 'Хост'], ['user', 'Пользователь'], ['src_ip', 'IP источника'], ['dest_ip', 'IP назначения'],
+    ['process_name', 'Процесс'], ['process_command_line', 'Командная строка'], ['event_action', 'Действие'],
+    ['raw_event_reference', 'Ссылка на оригинал'], ['related_event_ids', 'Связанные ID'],
+    ['processing_status', 'Состояние источника'],
+  ] as const).filter(([key]) => normalized[key] !== undefined && normalized[key] !== null && normalized[key] !== '')
+    .map(([key, label]) => ({ label, value: key === 'event_time' || key === 'ingestion_time'
+      ? dateText(normalized[key]) : Array.isArray(normalized[key])
+        ? normalized[key].map(value => valueText(value)).join(', ') : valueText(normalized[key]) }))
   const evidence = records(inv.evidence)
   const actions = records(inv.actions)
   const caseWrites = records(inv.case_writes)
@@ -413,6 +514,8 @@ function Investigation({ id, user }: { id: string; user: JsonRecord }) {
   const cases = records(inv.cases)
   const decisions = records(inv.decisions)
   const decision = decisions[decisions.length - 1] ?? {}
+  const modelDecision = [...decisions].reverse().find(item => item.model_name || item.model_classification)
+  const latestPlaybook = playbooks[playbooks.length - 1] ?? {}
   const admin = valueText(user.role).toLowerCase() === 'admin'
   const canReview = admin || user.role === 'analyst'
   const settings = asRecord(policy.data)
@@ -472,7 +575,21 @@ function Investigation({ id, user }: { id: string; user: JsonRecord }) {
         { label: 'Рекомендуемые действия', value: Array.isArray(inv.recommended_actions) ? inv.recommended_actions.map(value => valueText(value)).join(', ') || 'Не указаны' : 'Не указаны' },
         { label: 'Последнее решение', value: dateText(decision.created_at) },
       ]} /><div className="claim-grid"><EvidenceClaims title="Подтверждающие факты" claims={records(decision.evidence_for)} /><EvidenceClaims title="Противоречащие факты" claims={records(decision.evidence_against)} /></div></Panel></div>
+      <Panel className="analysis-panel" title="Модель и проверяемые правила"><div className="two-column"><section><h3 className="subheading">Результат LLM</h3>{modelDecision ? <><Meta entries={[
+        { label: 'Модель', value: valueText(modelDecision.model_name, 'Имя не записано') },
+        { label: 'Предложенная классификация', value: modelDecision.model_classification ? <Badge value={modelDecision.model_classification} /> : 'Не указана' },
+        { label: 'Уверенность модели', value: confidenceText(modelDecision.model_confidence) },
+        { label: 'Кандидат на автозакрытие', value: modelDecision.model_auto_close_candidate === true ? 'Предложен моделью' : modelDecision.model_auto_close_candidate === false ? 'Не предложен' : 'Не указано' },
+        { label: 'Версия промпта', value: valueText(modelDecision.prompt_version, 'Не указана') },
+      ]} /><p className="field__hint">Предложение модели отдельно от итогового решения и не разрешает действие без серверной политики.</p></> : <p className="panel-intro">Проверяемый результат LLM не записан. Анализатор: {valueText(inv.analyzer, 'не указан')}.</p>}</section>
+      <section><h3 className="subheading">Детерминированный плейбук</h3><Meta entries={[
+        { label: 'Выбранное правило', value: valueText(inv.playbook_key, 'Не выбрано') },
+        { label: 'Версия', value: valueText(inv.playbook_version, 'Не указана') },
+        { label: 'Выполнение', value: latestPlaybook.status ? <Badge value={latestPlaybook.status} /> : 'Не запускался' },
+        { label: 'Сработавшее правило источника', value: valueText(alert.rule, 'Не указано') },
+      ]} /><p className="field__hint">Этапы проверок и их результаты показаны на вкладке «Плейбук»; правило источника и серверная проверка решения учитываются отдельно.</p></section></div></Panel>
       <div className="detail-layout"><div>
+        <Panel title="Нормализованное событие"><p className="panel-intro">Поля показаны только при наличии в источнике; отсутствующие значения остаются неизвестными.</p>{normalizedEntries.length ? <Meta entries={normalizedEntries} /> : <Empty title="Нормализация недоступна" detail="Запись создана до сохранения нормализованной модели или содержит только исходное событие." />}</Panel>
         <div className="tabs" role="tablist" aria-label="Разделы расследования">{[['evidence', 'Доказательства'], ['decisions', 'Решения'], ['timeline', 'Временная шкала'], ['playbook', 'Плейбук'], ['actions', 'Действия и кейсы']].map(([key, label]) => <button key={key} type="button" role="tab" aria-selected={tab === key} className={tab === key ? 'tab tab--active' : 'tab'} onClick={() => setTab(key)}>{label}<span>{key === 'evidence' ? evidence.length : key === 'decisions' ? decisions.length : key === 'timeline' ? timeline.length : key === 'playbook' ? playbooks.length : actions.length + cases.length + caseWrites.length}</span></button>)}</div>
         {tab === 'evidence' && <Panel><div className="evidence-list">{evidence.length ? evidence.map((item, index) => <article className="evidence-item" key={valueText(item.id, String(index))}><div className="evidence-item__head"><div><span className="record-index">EV-{String(index + 1).padStart(2, '0')}</span><h3>{valueText(item.kind, 'Доказательство')}</h3></div><time>{dateText(item.event_at ?? item.collected_at)}</time></div><p className="panel-intro">{valueText(item.summary)}</p><div className="evidence-item__source">{valueText(item.source, 'Источник не указан')} · ID {valueText(item.id)}</div>{item.data !== undefined && <pre className="evidence-data">{JSON.stringify(item.data, null, 2)}</pre>}</article>) : <Empty title="Доказательства ещё не собраны" detail="Проверьте ход плейбука и доступность источников. Без достаточных данных решение должно требовать проверки." />}</div></Panel>}
         {tab === 'decisions' && <Panel title="История решений">{decisions.length ? <div className="decision-history">{decisions.map((item, index) => <article className="decision-history__item" key={valueText(item.id, String(index))}><div className="decision-history__head"><div><strong>{valueText(item.summary, 'Решение')}</strong><small>{dateText(item.created_at)} · {valueText(item.actor, 'Система')}</small></div><Badge value={item.classification} /></div><p>{valueText(item.rationale, 'Обоснование не указано')}</p><Meta entries={[{ label: 'Уверенность', value: confidenceText(item.confidence) }, { label: 'Маршрут действий', value: <Badge value={item.verdict} /> }]} /><div className="claim-grid"><EvidenceClaims title="Подтверждающие факты" claims={records(item.evidence_for)} /><EvidenceClaims title="Противоречащие факты" claims={records(item.evidence_against)} /></div></article>)}</div> : <Empty title="Решений нет" detail="Классификация появится после обработки плейбука или проверки аналитика." />}</Panel>}
@@ -481,7 +598,7 @@ function Investigation({ id, user }: { id: string; user: JsonRecord }) {
           const steps = Array.isArray(item.steps) ? item.steps.map(step => typeof step === 'string' ? { title: step } : asRecord(step)) : []
           return <article key={valueText(item.id, String(index))}><div className="playbook-list__head"><div><h3>{valueText(item.key, 'Общий плейбук')}</h3><p>Версия {valueText(item.version)}</p></div><Badge value={item.status} /></div><Meta entries={[{ label: 'Начат', value: dateText(item.started_at) }, { label: 'Завершён', value: dateText(item.completed_at) }]} />{steps.length > 0 && <ol className="steps">{steps.map((step, stepIndex) => <li key={stepIndex}><span>{stepIndex + 1}</span><div><strong>{valueText(first(step, 'title', 'name', 'step'), 'Шаг')}</strong><small>{valueText(first(step, 'detail', 'result', 'description'), '')}</small></div><Badge value={step.status} /></li>)}</ol>}</article>
         })}</div> : <Empty title="Плейбук не запускался" detail="Запись выполнения появится после обработки алерта фоновым worker." />}</Panel>}
-        {tab === 'actions' && <div className="action-grid"><Panel title="Действия">{actions.length ? <div className="stack-list">{actions.map((item, index) => <div className="operation-row" key={valueText(item.id, String(index))}><div><strong>{statusLabel(item.kind)}</strong><small>{dateText(item.completed_at ?? item.attempted_at)} · {valueText(item.external_id)}</small>{valueText(asRecord(item.detail).message, '') && <small>{valueText(asRecord(item.detail).message)}</small>}{item.status === 'unknown' && admin && <button className="button button--small button--secondary" disabled={!!actionBusy} onClick={() => void reconcile(valueText(item.id))}>Сверить результат</button>}</div><Badge value={item.status} /></div>)}</div> : <Empty title="Действий нет" detail="Автоматические действия выполняются только если их разрешает политика." />}</Panel><Panel title="Кейсы TheHive">{cases.length ? <div className="stack-list">{cases.map((item, index) => <div className="operation-row" key={valueText(item.id, String(index))}><div><strong>{valueText(item.title, 'Кейс')}</strong><small>Внешний ID: {valueText(item.external_id)}</small>{admin && ['controlled_automation', 'approved_response'].includes(valueText(settings.automation_level)) && (mode === 'demo' || settings.connected_writes_enabled === true) && valueText(item.external_id, '') && <CaseStatusControl key={valueText(item.id)} caseId={valueText(item.id)} currentStatus={valueText(item.status, '')} onUpdated={reload} />}</div><Badge value={item.status} /></div>)}</div> : <Empty title="Кейс не создан" detail="Кейс появится при подтверждённой эскалации и успешном ответе TheHive." />}</Panel></div>}
+        {tab === 'actions' && <div className="action-grid"><Panel title="Действия">{actions.length ? <div className="stack-list">{actions.map((item, index) => <div className="operation-row" key={valueText(item.id, String(index))}><div><strong>{statusLabel(item.kind)}</strong><small>{dateText(item.completed_at ?? item.attempted_at)} · {valueText(item.external_id)}</small>{valueText(asRecord(item.detail).message, '') && <small>{valueText(asRecord(item.detail).message)}</small>}{item.status === 'unknown' && admin && <button className="button button--small button--secondary" disabled={!!actionBusy} onClick={() => void reconcile(valueText(item.id))}>Сверить результат</button>}</div><Badge value={item.status} /></div>)}</div> : <Empty title="Действий нет" detail="Автоматические действия выполняются только если их разрешает политика." />}</Panel><Panel title="Кейсы TheHive">{cases.length ? <div className="stack-list">{cases.map((item, index) => <div className="operation-row" key={valueText(item.id, String(index))}><div><strong>{valueText(item.title, 'Кейс')}</strong><CaseFacts item={item} writes={caseWrites} classification={inv.classification} rationale={inv.rationale} missingData={inv.missing_data} />{admin && ['controlled_automation', 'approved_response'].includes(valueText(settings.automation_level)) && (mode === 'demo' || settings.connected_writes_enabled === true) && valueText(item.external_id, '') && <CaseStatusControl key={valueText(item.id)} caseId={valueText(item.id)} currentStatus={valueText(item.status, '')} onUpdated={reload} />}</div><Badge value={item.status} /></div>)}</div> : <Empty title="Кейс не создан" detail="Кейс появится при подтверждённой эскалации и успешном ответе TheHive." />}</Panel></div>}
         {tab === 'actions' && caseWrites.length > 0 && <Panel title="Этапы записи TheHive"><div className="stack-list">{caseWrites.map((item, index) => <div className="operation-row" key={valueText(item.id, String(index))}><div><strong>{valueText(item.sequence)}. {statusLabel(item.kind)}</strong><small>Попыток: {valueText(item.attempts)} · ID операции: {valueText(item.id)}</small><small>Подтверждение: {valueText(item.external_id, 'не получено')} · {dateText(item.completed_at ?? item.attempted_at)}</small>{typeof item.error_type === 'string' && item.error_type && <small>Ошибка: {item.error_type}</small>}</div><Badge value={item.status} /></div>)}</div></Panel>}
       </div><aside className="detail-aside"><Panel title="Проверка аналитика"><p className="panel-intro">Классификация сохраняется в аудите. Действия по итогам решения проверяет серверная политика.</p>{canReview ? <form className="form-stack" onSubmit={reviewed}><Field label="Классификация"><select value={classification} onChange={event => setClassification(event.target.value)}>{classifications.map(key => <option key={key} value={key}>{statusLabel(key)}</option>)}</select></Field><Field label="Обоснование"><textarea value={note} onChange={event => setNote(event.target.value)} required minLength={3} maxLength={2000} rows={5} placeholder="Укажите наблюдения и основания решения" /></Field><button className="button button--primary button--wide" disabled={mutation.busy}>{mutation.busy ? 'Сохранение…' : 'Сохранить решение'}</button><Notice flash={mutation.flash} /></form> : <p className="panel-intro">Для изменения решения нужна роль аналитика или администратора.</p>}</Panel>
         <Panel title="Разрешённые действия">{policy.error && <ErrorState message={policy.error} retry={policy.reload} />}{!policy.error && !canAct && <p className="panel-intro">Ручные действия доступны администратору только в режиме контролируемой автоматизации или разрешённого реагирования.</p>}{canAct && <div className="action-buttons"><button className="button button--secondary" disabled={!!actionBusy || inv.classification !== 'TP'} onClick={() => void perform('create_case')}>Создать кейс</button><button className="button button--secondary" disabled={!!actionBusy || inv.classification !== 'FP'} onClick={() => void perform('close_alert')}>Закрыть алерт</button>{mode === 'demo' && <><button className="button button--quiet" disabled={!!actionBusy} onClick={() => void perform('disable_account_demo')}>DEMO: блокировать учётную запись</button><button className="button button--quiet" disabled={!!actionBusy} onClick={() => void perform('isolate_host_demo')}>DEMO: изолировать хост</button></>}</div>}<Notice flash={actionFlash} /></Panel>
@@ -859,6 +976,24 @@ function MispNoticeRow({ item, role, onUpdated }: { item: JsonRecord; role: stri
   </article>
 }
 
+function integrationEntries(item: JsonRecord): { label: string; value: ReactNode }[] {
+  const name = valueText(item.name)
+  const entries: { label: string; value: ReactNode }[] = [
+    { label: name === 'worker' && item.status !== 'not_applicable' ? 'Последний сигнал' : 'Последняя проверка', value: dateText(item.last_checked_at) },
+  ]
+  if (name === 'splunk') entries.push({ label: 'Последнее поступление', value: dateText(item.last_received_at) })
+  entries.push({ label: 'Последняя успешная проверка', value: dateText(item.last_success_at) })
+  if (name === 'thehive') entries.push({ label: 'Совместимость API', value: item.status === 'healthy' && /^API 5\.7\.\d+/.test(valueText(item.detail, '')) ? `Подтверждена: ${valueText(item.detail)}` : 'Не подтверждена этой проверкой' })
+  if (item.version) entries.push({ label: 'Версия API', value: valueText(item.version) })
+  if (item.compatibility) entries.push({ label: 'Совместимость', value: valueText(item.compatibility) })
+  if (item.last_error) {
+    entries.push({ label: 'Последняя ошибка', value: valueText(item.last_error) })
+    entries.push({ label: 'Время последней ошибки', value: dateText(item.last_error_at) })
+  }
+  entries.push({ label: 'Подробности', value: valueText(item.detail, 'Нет данных') })
+  return entries
+}
+
 function Integrations({ user }: { user: JsonRecord }) {
   const { data, loading, error, reload } = useResource('/integrations', 15000)
   const notices = useResource('/misp/notices', 30000)
@@ -871,14 +1006,7 @@ function Integrations({ user }: { user: JsonRecord }) {
   const check = () => void mutation.run(() => api('/integrations/check', { method: 'POST' }), 'Проверка поставлена в очередь. Результат появится после обработки.', refresh)
   return <><PageHead title="Интеграции и поступление логов" description="Доступность API и свежесть источников показываются отдельно от числа алертов." actions={<>{admin && <button className="button button--primary" disabled={mutation.busy} onClick={check}>{mutation.busy ? 'Запуск…' : 'Запустить проверку'}</button>}<button className="button button--secondary" onClick={refresh}>Обновить данные</button></>} />
     <Notice flash={mutation.flash} />{error && <ErrorState message={error} retry={reload} />}
-    {loading && !data ? <Loading /> : list.length ? <div className="integration-grid">{list.map((item, index) => <Panel key={valueText(item.name, String(index))} className="integration-card"><div className="integration-card__top"><div><h2>{integrationName(item.name)}</h2><p>{integrationDetail(item, user.mode)}</p></div><Badge value={item.status} /></div><Meta entries={item.name === 'worker' ? [
-      { label: 'Последний сигнал', value: dateText(item.last_checked_at) },
-      { label: 'Подробности', value: valueText(item.detail, 'Нет данных') },
-    ] : [
-      { label: 'Последняя проверка', value: dateText(item.last_checked_at) },
-      { label: 'Последнее поступление', value: dateText(item.last_received_at) },
-      { label: 'Подробности', value: valueText(item.detail, 'Нет данных') },
-    ]} />{item.status === 'unknown' && <p className="unknown-note">{item.name === 'worker' ? 'Сигнал worker ещё не поступал. Обработка очереди не подтверждена.' : 'Статус неизвестен. Отсутствие алертов не подтверждает работу источника.'}</p>}{item.status === 'stale' && item.name === 'worker' && <p className="unknown-note">Сигнал worker не поступал более 3 минут. Проверьте обработку очереди.</p>}</Panel>)}</div> : <Empty title="Состояние интеграций неизвестно" detail="Сервер не вернул ни одного источника. Отсутствие алертов не означает, что сбор работает." />}
+    {loading && !data ? <Loading /> : list.length ? <div className="integration-grid">{list.map((item, index) => <Panel key={valueText(item.name, String(index))} className="integration-card"><div className="integration-card__top"><div><h2>{integrationName(item.name, user.mode)}</h2><p>{integrationDetail(item, user.mode)}</p></div><Badge value={item.status} /></div><Meta entries={integrationEntries(item)} />{item.status === 'unknown' && <p className="unknown-note">{item.name === 'worker' ? 'Сигнал worker ещё не поступал. Обработка очереди не подтверждена.' : ['splunk', 'misp'].includes(valueText(item.name)) ? 'Статус неизвестен. Отсутствие алертов не подтверждает работу источника.' : 'Состояние этой зависимости пока не подтверждено.'}</p>}{item.status === 'stale' && item.name === 'worker' && <p className="unknown-note">Сигнал worker не поступал более 3 минут. Проверьте обработку очереди.</p>}</Panel>)}</div> : <Empty title="Состояние интеграций неизвестно" detail="Сервер не вернул ни одного источника. Отсутствие алертов не означает, что сбор работает." />}
     <Panel title="Уведомления НКЦКБ (MISP)" aside={<span className="quiet">{noticeList.length} записей</span>}><p className="panel-intro">Поступление, решение L1 и подтверждение передачи L2 учитываются отдельно.</p>{notices.error && <ErrorState message={notices.error} retry={notices.reload} />}{notices.loading && !notices.data ? <Loading /> : noticeList.length ? <div className="misp-notice-list">{noticeList.map((item, index) => <MispNoticeRow key={valueText(item.id, String(index))} item={item} role={role} onUpdated={notices.reload} />)}</div> : <Empty title="Уведомлений нет" detail="Проверьте доступность MISP и запустите проверку интеграций. Пустой список не подтверждает работу источника." />}</Panel></>
 }
 
@@ -956,8 +1084,13 @@ function Shifts({ user }: { user: JsonRecord }) {
 function Audit() {
   const { data, loading, error, reload } = useResource('/audit')
   const list = records(data)
-  return <><PageHead title="Журнал аудита" description="Изменения решений, политики и внешние действия с зафиксированным результатом." actions={<button className="button button--secondary" onClick={reload}>Обновить</button>} />
-    {error && <ErrorState message={error} retry={reload} />}{loading && !data ? <Loading /> : <Panel title="Последние записи">{list.length ? <div className="table-wrap"><table><thead><tr><th>Время</th><th>Операция</th><th>Исполнитель</th><th>Объект</th><th>Подробности</th></tr></thead><tbody>{list.map((item, index) => <tr key={valueText(item.id, String(index))}><td className="number">{dateText(item.created_at)}</td><td><strong>{valueText(item.operation)}</strong></td><td>{valueText(item.actor, 'Система')}</td><td>{valueText(item.subject_type)}<small className="cell-sub">{valueText(item.subject_id, '')}</small></td><td><pre className="audit-detail">{item.detail && typeof item.detail === 'object' ? JSON.stringify(item.detail, null, 2) : valueText(item.detail, '')}</pre></td></tr>)}</tbody></table></div> : <Empty title="Записей аудита нет" detail="Операции появятся здесь после обработки алертов и действий пользователей." />}</Panel>}</>
+  return <><PageHead title="Журнал аудита" description="Решения, изменения политики и внешние действия. Результат показан, если он записан отдельно." actions={<button className="button button--secondary" onClick={reload}>Обновить</button>} />
+    {error && <ErrorState message={error} retry={reload} />}{loading && !data ? <Loading /> : <Panel title="Последние записи">{list.length ? <div className="table-wrap"><table><thead><tr><th>Время</th><th>Операция</th><th>Результат</th><th>Исполнитель</th><th>Объект</th><th>Подробности</th></tr></thead><tbody>{list.map((item, index) => {
+      const detail = asRecord(item.detail)
+      const outcome = item.outcome ?? first(detail, 'status', 'result', 'outcome')
+      const detailText = item.detail && typeof item.detail === 'object' ? JSON.stringify(item.detail, null, 2) : valueText(item.detail, '')
+      return <tr key={valueText(item.id, String(index))}><td className="number">{dateText(item.created_at)}</td><td><strong>{valueText(item.operation)}</strong></td><td>{outcome ? <Badge value={outcome} /> : <span className="quiet">Отдельно не указан</span>}</td><td>{valueText(item.actor, 'Система')}</td><td>{valueText(item.subject_type)}<small className="cell-sub">{valueText(item.subject_id, '')}</small></td><td>{detailText && detailText !== '{}' ? <details className="audit-disclosure"><summary>{valueText(first(detail, 'reason', 'message'), 'Показать подробности')}</summary><pre className="audit-detail">{detailText}</pre></details> : '—'}</td></tr>
+    })}</tbody></table></div> : <Empty title="Записей аудита нет" detail="Операции появятся здесь после обработки алертов и действий пользователей." />}</Panel>}</>
 }
 
 function Settings({ user }: { user: JsonRecord }) {
@@ -1131,6 +1264,7 @@ export default function App() {
     if (!user) return null
     if (path === '/') return <Dashboard user={user} />
     if (path === '/alerts') return <Alerts user={user} />
+    if (path === '/cases') return <Cases />
     if (path.startsWith('/investigations/')) return <Investigation id={decodeURIComponent(path.split('/')[2] || '')} user={user} />
     if (path === '/contexts') return <Contexts user={user} />
     if (path === '/suppression') return <SuppressionPolicies user={user} />

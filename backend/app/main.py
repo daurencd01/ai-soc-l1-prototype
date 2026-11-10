@@ -11,13 +11,15 @@ from uuid import uuid4
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select, text
+from sqlalchemy import and_, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .adapters import AdapterError, validate_case_fields
 from .config import settings
 from .db import SessionLocal, get_db
 from .classification import Classification, action_lane, classification_for_lane
+from .case_views import case_reference, case_sync_statuses, list_case_views
+from .case_builder import _safe_reference
 from .metrics import metric_snapshot
 from .observability import log_event
 from .models import (Action, Alert, Asset, Audit, Case, CaseWrite, DeadLetter, Decision, Evidence,
@@ -29,7 +31,8 @@ from .policy import aware as policy_aware, record_event, validate_contract
 from .request_limits import login_limiter, read_bounded_body
 from .report import build_report, export_docx_bytes, export_txt_bytes, next_report_version
 from .security import (admin, analyst, audit, current_user, hash_password, policy_approver,
-                       policy_revoker, token_for, validate_runtime_secrets, verify_password)
+                       policy_revoker, token_for, validate_connected_passwords,
+                       validate_runtime_secrets, verify_password)
 from .state import PipelineState, move_alert
 from .suppression import (record_event as record_suppression_event,
                           validate_contract as validate_suppression_contract)
@@ -75,6 +78,8 @@ def seed() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     validate_runtime_secrets(settings().mode, settings().jwt_secret, settings().webhook_secret)
+    validate_connected_passwords(settings().mode, settings().connected_admin_password,
+                                 settings().connected_analyst_password)
     seed()
     yield
 
@@ -108,8 +113,8 @@ async def structured_request_log(request: Request, call_next):
 
 
 class LoginIn(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=1, max_length=1024)
 
 
 class ReviewIn(BaseModel):
@@ -197,6 +202,15 @@ def serialize(row, keys: tuple[str, ...]) -> dict:
     return {key: getattr(row, key) for key in keys}
 
 
+def alert_source_reference(alert: Alert) -> str | None:
+    raw = alert.raw if isinstance(alert.raw, dict) else {}
+    for key in ("raw_event_reference", "splunk_url", "event_url"):
+        reference = _safe_reference(raw.get(key))
+        if reference:
+            return reference
+    return None
+
+
 def exception_view(row: ExceptionRule) -> dict:
     return {**serialize(row, ("id", "policy_key", "version", "rule", "entity", "owner", "created_by",
                               "reason", "scope", "valid_from", "valid_until", "approval_status",
@@ -214,8 +228,9 @@ def suppression_view(row: SuppressionRule) -> dict:
 
 
 def integration_view(row: IntegrationState) -> dict:
-    item = serialize(row, ("id", "name", "status", "last_checked_at", "last_received_at", "detail"))
-    if row.name == "worker" and row.last_checked_at and utcnow() - aware(row.last_checked_at) > timedelta(minutes=3):
+    item = serialize(row, ("id", "name", "status", "last_checked_at", "last_success_at",
+                           "last_error_at", "last_error", "last_received_at", "detail"))
+    if row.name == "worker" and row.status == "healthy" and row.last_checked_at and utcnow() - aware(row.last_checked_at) > timedelta(minutes=3):
         item["status"] = "stale"
         item["detail"] = "Нет heartbeat worker более 3 минут"
     return item
@@ -318,12 +333,17 @@ def dashboard(user: User = Depends(current_user), db: Session = Depends(get_db))
                     for x in db.scalars(select(IntegrationState).where(IntegrationState.tenant_id == user.tenant_id)).all()]
     present = {x["name"] for x in integrations}
     integrations += [{"name": name, "status": "unknown", "last_checked_at": None, "last_received_at": None,
-                      "detail": "Проверка ещё не выполнялась"} for name in ("splunk", "thehive", "misp", "worker") if name not in present]
+                      "detail": "Проверка ещё не выполнялась"} for name in
+                     ("splunk", "thehive", "misp", "ollama", "database", "redis", "worker") if name not in present]
     return {"queue": statuses, "alerts_total": db.scalar(select(func.count()).select_from(Alert).where(Alert.tenant_id == user.tenant_id)),
             "investigations_total": db.scalar(select(func.count()).select_from(Investigation).where(Investigation.tenant_id == user.tenant_id)),
             "classification_counts": operational["triage_results_total"],
             "cases_created_total": operational["cases_created_total"],
             "deduplicated_total": operational["alert_deduplicated_total"],
+            "automated_handling_rate": operational["automated_handling_rate"],
+            "automated_handling_total": operational["automated_handling_total"],
+            "processed_investigations_total": operational["processed_investigations_total"],
+            "integration_errors_total": operational["integration_errors_total"],
             "integrations": integrations, "mode": settings().mode.upper(),
             "automation_level": db.get(Tenant, user.tenant_id).automation_level}
 
@@ -332,8 +352,12 @@ def dashboard(user: User = Depends(current_user), db: Session = Depends(get_db))
 def alerts(status: str | None = None, verdict: str | None = None,
            classification: Classification | None = None, search: str | None = None,
            limit: int = 100, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    query = select(Alert, Investigation.verdict, Investigation.classification, Investigation.confidence).join(
-        Investigation, Alert.investigation_id == Investigation.id).where(Alert.tenant_id == user.tenant_id)
+    query = select(Alert, Investigation.verdict, Investigation.classification, Investigation.confidence,
+                   Investigation.summary, Investigation.rationale,
+                   Case.id, Case.status, Case.external_id).join(
+        Investigation, Alert.investigation_id == Investigation.id).outerjoin(
+        Case, and_(Case.investigation_id == Investigation.id, Case.tenant_id == user.tenant_id)).where(
+        Alert.tenant_id == user.tenant_id, Investigation.tenant_id == user.tenant_id)
     if status:
         query = query.where(Alert.status == status)
     if verdict:
@@ -343,16 +367,28 @@ def alerts(status: str | None = None, verdict: str | None = None,
     if search:
         query = query.where(Alert.title.ilike(f"%{search[:100]}%"))
     rows = db.execute(query.order_by(Alert.received_at.desc()).limit(min(max(limit, 1), 500))).all()
+    sync_statuses = case_sync_statuses(db, user.tenant_id,
+        {case_id: external_id for _, _, _, _, _, _, case_id, _, external_id in rows if case_id})
     return {"items": [{**serialize(a, ("id", "title", "rule", "severity", "status", "pipeline_state",
                                     "event_at", "received_at", "source", "source_event_id", "investigation_id",
                                     "fingerprint")),
-                       "verdict": v, "classification": c, "confidence": confidence}
-                      for a, v, c, confidence in rows], "total": len(rows)}
+                       "verdict": v, "classification": c, "confidence": confidence,
+                       "decision_summary": summary, "decision_reason": (rationale or "")[:1000],
+                       "source_reference": alert_source_reference(a),
+                       "case_id": case_id, "case_status": case_status,
+                       "case_external_id": case_external_id,
+                       "case_sync_status": sync_statuses.get(case_id) if case_id else None}
+                      for a, v, c, confidence, summary, rationale, case_id, case_status, case_external_id in rows],
+            "total": len(rows)}
 
 
 @app.get("/api/investigations/{investigation_id}")
 def investigation(investigation_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     inv = scoped(db, Investigation, user.tenant_id, investigation_id)
+    inv_cases = db.scalars(select(Case).where(Case.tenant_id == user.tenant_id,
+        Case.investigation_id == inv.id)).all()
+    case_states = case_sync_statuses(db, user.tenant_id,
+        {row.id: row.external_id for row in inv_cases})
     return {**serialize(inv, ("id", "correlation_key", "status", "verdict", "classification", "confidence",
                               "priority", "summary", "rationale", "missing_data",
                               "recommended_actions", "playbook_key", "playbook_version", "analyzer", "created_at", "started_at", "completed_at", "due_at")),
@@ -370,7 +406,10 @@ def investigation(investigation_id: str, user: User = Depends(current_user), db:
                               for x in db.scalars(select(PlaybookRun).where(PlaybookRun.tenant_id == user.tenant_id, PlaybookRun.investigation_id == inv.id)).all()],
             "decisions": [serialize(x, ("id", "verdict", "classification", "confidence", "priority",
                                         "summary", "rationale", "evidence_ids", "evidence_for", "evidence_against",
-                                        "missing_data", "recommended_actions", "actor", "created_at"))
+                                        "related_event_ids", "mitre_techniques", "missing_data",
+                                        "recommended_actions", "model_auto_close_candidate",
+                                        "model_classification", "model_confidence", "model_name",
+                                        "model_digest", "prompt_version", "prompt_sha256", "actor", "created_at"))
                           for x in db.scalars(select(Decision).where(Decision.tenant_id == user.tenant_id, Decision.investigation_id == inv.id)).all()],
             "actions": [serialize(x, ("id", "kind", "status", "target", "external_id", "detail", "attempted_at", "completed_at"))
                         for x in db.scalars(select(Action).where(Action.tenant_id == user.tenant_id, Action.investigation_id == inv.id)).all()],
@@ -379,8 +418,10 @@ def investigation(investigation_id: str, user: User = Depends(current_user), db:
                                           "error_type", "attempted_at", "completed_at"))
                             for x in db.scalars(select(CaseWrite).where(CaseWrite.tenant_id == user.tenant_id,
                                 CaseWrite.investigation_id == inv.id).order_by(CaseWrite.sequence)).all()],
-            "cases": [serialize(x, ("id", "external_id", "status", "title", "data", "created_at"))
-                      for x in db.scalars(select(Case).where(Case.tenant_id == user.tenant_id, Case.investigation_id == inv.id)).all()]}
+            "cases": [{**serialize(x, ("id", "external_id", "status", "title", "data", "created_at")),
+                       "sync_status": case_states[x.id],
+                       "case_reference": case_reference(x.external_id, case_states[x.id])}
+                      for x in inv_cases]}
 
 
 @app.post("/api/investigations/{investigation_id}/review")
@@ -440,10 +481,21 @@ def manual_action(investigation_id: str, kind: Literal["create_case", "close_ale
         db.commit()
     action = perform_action(db, tenant, inv, alert, kind, evidence)
     if action:
+        if action.status == "succeeded" and kind in {"create_case", "close_alert"}:
+            terminal_status = "escalated" if kind == "create_case" else "closed"
+            inv.status = terminal_status
+            inv.completed_at = utcnow()
+            alert.status = terminal_status
+            alert.processed_at = utcnow()
         audit(db, user.tenant_id, user.username, "manual_action_requested", "action", action.id,
               {"kind": kind, "outcome": action.status})
         db.commit()
     return serialize(action, ("id", "kind", "status", "external_id", "detail")) if action else {"status": "blocked"}
+
+
+@app.get("/api/cases")
+def cases(limit: int = 100, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    return {"items": list_case_views(db, user.tenant_id, limit)}
 
 
 @app.get("/api/cases/{case_id}/statuses")
@@ -847,7 +899,8 @@ def integrations(user: User = Depends(current_user), db: Session = Depends(get_d
     rows = db.scalars(select(IntegrationState).where(IntegrationState.tenant_id == user.tenant_id)).all()
     mapped = {x.name: integration_view(x) for x in rows}
     return {"items": [mapped.get(name, {"name": name, "status": "unknown", "last_checked_at": None,
-                    "last_received_at": None, "detail": "Проверка ещё не выполнялась"}) for name in ("splunk", "thehive", "misp", "worker")]}
+                    "last_received_at": None, "detail": "Проверка ещё не выполнялась"}) for name in
+                    ("splunk", "thehive", "misp", "ollama", "database", "redis", "worker")]}
 
 
 @app.get("/api/integrations/webhook-config")
@@ -967,7 +1020,31 @@ def export(shift_id: str, format: Literal["txt", "docx"] = "txt", user: User = D
 @app.get("/api/audit")
 def audit_list(user: User = Depends(current_user), db: Session = Depends(get_db)):
     rows = db.scalars(select(Audit).where(Audit.tenant_id == user.tenant_id).order_by(Audit.created_at.desc()).limit(300)).all()
-    return {"items": [serialize(x, ("id", "actor", "operation", "subject_type", "subject_id", "detail", "created_at")) for x in rows]}
+    return {"items": [{**serialize(x, ("id", "actor", "operation", "subject_type", "subject_id", "detail", "created_at")),
+                       "outcome": audit_outcome(x)} for x in rows]}
+
+
+def audit_outcome(row: Audit) -> str:
+    """Describe the logged operation without implying an external write succeeded."""
+    detail = row.detail if isinstance(row.detail, dict) else {}
+    for key in ("outcome", "status", "result"):
+        value = detail.get(key)
+        if isinstance(value, str) and value in {
+                "succeeded", "failed", "unknown", "pending", "blocked", "denied",
+                "healthy", "unavailable", "needs_review", "confirmed", "suppressed"}:
+            return value
+    operation = row.operation
+    if operation == "action_succeeded":
+        return "succeeded"
+    if operation.endswith("_denied") or operation == "action_denied_conflict":
+        return "denied"
+    if operation.endswith("_attempted"):
+        return "attempted"
+    if operation.endswith("_requested"):
+        return "requested"
+    if operation == "integration_error" or operation.endswith("_failed"):
+        return "failed"
+    return "recorded"
 
 
 @app.get("/api/settings")
@@ -1059,13 +1136,25 @@ def reconcile_action(action_id: str, user: User = Depends(admin), db: Session = 
         db.commit()
         return serialize(result, ("id", "status", "external_id", "detail"))
     inv = scoped(db, Investigation, user.tenant_id, action.investigation_id)
-    alert = db.scalar(select(Alert).where(Alert.tenant_id == user.tenant_id, Alert.investigation_id == inv.id).order_by(Alert.received_at))
+    if action.kind == "close_alert":
+        prefix = f"{inv.id}:close_alert:"
+        if not action.idempotency_key.startswith(prefix):
+            raise HTTPException(409, "Исходный алерт закрытия не определён")
+        alert = db.scalar(select(Alert).where(
+            Alert.tenant_id == user.tenant_id, Alert.investigation_id == inv.id,
+            Alert.id == action.idempotency_key[len(prefix):],
+            Alert.source_event_id == action.target))
+    else:
+        alert = db.scalar(select(Alert).where(Alert.tenant_id == user.tenant_id,
+            Alert.investigation_id == inv.id).order_by(Alert.received_at))
+    if alert is None:
+        raise HTTPException(409, "Исходный алерт действия не найден")
     evidence = db.scalars(select(Evidence).where(Evidence.tenant_id == user.tenant_id, Evidence.investigation_id == inv.id)).all()
     result = perform_action(db, tenant, inv, alert, action.kind, evidence)
     audit(db, user.tenant_id, user.username, "action_reconcile_requested", "action", action.id,
-          {"outcome": result.status})
+          {"outcome": result.status if result else "blocked"})
     db.commit()
-    return serialize(result, ("id", "status", "external_id", "detail"))
+    return serialize(result, ("id", "status", "external_id", "detail")) if result else {"status": "blocked"}
 
 
 def _check_demo() -> None:

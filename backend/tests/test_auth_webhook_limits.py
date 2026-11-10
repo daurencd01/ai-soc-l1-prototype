@@ -13,7 +13,19 @@ from app.config import settings
 from app.db import Base, get_db
 from app.models import Tenant, User
 from app.request_limits import LoginRateLimiter
-from app.security import hash_password
+from app.security import hash_password, validate_connected_passwords
+
+
+def test_connected_passwords_reject_short_and_placeholder_values():
+    for value in ("x", "demo-password-123456", " change-this-password-123 "):
+        try:
+            validate_connected_passwords("CONNECTED", value, "")
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("CONNECTED accepted an unsafe admin password")
+    validate_connected_passwords("CONNECTED", "long-unique-admin-password", "long-unique-analyst-password")
+    validate_connected_passwords("DEMO", "", "")
 
 
 def test_webhook_rejects_large_and_non_object_bodies():
@@ -60,6 +72,10 @@ def test_login_blocks_after_ten_failed_guesses(monkeypatch):
     main_module.app.dependency_overrides[get_db] = override_db
     try:
         client = TestClient(main_module.app)
+        assert client.post("/api/auth/login", json={
+            "username": "x" * 101, "password": "valid-password-1234"}).status_code == 422
+        assert client.post("/api/auth/login", json={
+            "username": "limited-admin", "password": "x" * 1025}).status_code == 422
         for _ in range(10):
             assert client.post("/api/auth/login", json={
                 "username": "limited-admin", "password": "wrong-password"}).status_code == 401

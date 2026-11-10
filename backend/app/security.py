@@ -29,6 +29,18 @@ def validate_runtime_secrets(mode: str, jwt_secret: str, webhook_secret: str) ->
         raise RuntimeError("CONNECTED требует отдельные сильные JWT_SECRET и WEBHOOK_SECRET")
 
 
+def validate_connected_passwords(mode: str, admin_password: str, analyst_password: str) -> None:
+    if mode.upper() != "CONNECTED":
+        return
+    passwords = {"CONNECTED_ADMIN_PASSWORD": admin_password}
+    if analyst_password:
+        passwords["CONNECTED_ANALYST_PASSWORD"] = analyst_password
+    for name, password in passwords.items():
+        if (not 12 <= len(password) <= 256 or password != password.strip()
+                or password.lower().startswith(("demo-", "change-", "replace-"))):
+            raise RuntimeError(f"{name} должен быть отдельным сильным паролем длиной 12–256 символов")
+
+
 def hash_password(password: str) -> str:
     salt = os.urandom(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 310_000)
